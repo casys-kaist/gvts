@@ -1962,7 +1962,6 @@ static int ttwu_remote(struct task_struct *p, int wake_flags)
 	int ret = 0;
 
 	rq = __task_rq_lock(p);
-
 	if (task_on_rq_queued(p)) {
 		/* check_preempt_curr() may use rq clock */
 		update_rq_clock(rq);
@@ -2488,7 +2487,6 @@ int sysctl_numa_balancing(struct ctl_table *table, int write,
 #endif
 
 DEFINE_STATIC_KEY_FALSE(sched_schedstats);
-static bool __initdata __sched_schedstats = false;
 
 #ifdef CONFIG_SCHEDSTATS
 static void set_schedstats(bool enabled)
@@ -2512,16 +2510,12 @@ static int __init setup_schedstats(char *str)
 	int ret = 0;
 	if (!str)
 		goto out;
-	/*
-	 * This code is called before jump labels have been set up, so we can't
-	 * change the static branch directly just yet.  Instead set a temporary
-	 * variable so init_schedstats() can do it later.
-	 */
+
 	if (!strcmp(str, "enable")) {
-		__sched_schedstats = true;
+		set_schedstats(true);
 		ret = 1;
 	} else if (!strcmp(str, "disable")) {
-		__sched_schedstats = false;
+		set_schedstats(false);
 		ret = 1;
 	}
 out:
@@ -2531,11 +2525,6 @@ out:
 	return ret;
 }
 __setup("schedstats=", setup_schedstats);
-
-static void __init init_schedstats(void)
-{
-	set_schedstats(__sched_schedstats);
-}
 
 #ifdef CONFIG_PROC_SYSCTL
 int sysctl_schedstats(struct ctl_table *table, int write,
@@ -2557,9 +2546,7 @@ int sysctl_schedstats(struct ctl_table *table, int write,
 		set_schedstats(state);
 	return err;
 }
-#endif /* CONFIG_PROC_SYSCTL */
-#else /* !CONFIG_SCHEDSTATS */
-static inline void init_schedstats(void) {}
+#endif
 #endif
 
 /*
@@ -5523,13 +5510,15 @@ void show_state_filter(unsigned long state_filter)
 		/*
 		 * reset the NMI-timeout, listing all files on a slow
 		 * console might take a lot of time:
+		 * Also, reset softlockup watchdogs on all CPUs, because
+		 * another CPU might be blocked waiting for us to process
+		 * an IPI.
 		 */
 		touch_nmi_watchdog();
+		touch_all_softlockup_watchdogs();
 		if (!state_filter || (p->state & state_filter))
 			sched_show_task(p);
 	}
-
-	touch_all_softlockup_watchdogs();
 
 #ifdef CONFIG_SCHED_DEBUG
 	sysrq_sched_debug_show();
@@ -6351,10 +6340,6 @@ static void free_sched_domain(struct rcu_head *rcu)
 		kfree(sd->groups->sgc);
 		kfree(sd->groups);
 	}
-#if 0
-	if (sd->vruntime && atomic_dec_and_test(&sd->vruntime->ref))
-		kfree(sd->vruntime);
-#endif
 	kfree(sd);
 }
 
@@ -8334,7 +8319,6 @@ void __init sched_init(void)
 		rq->active_balance = 0;
 		rq->next_balance = jiffies;
 		rq->push_cpu = 0;
-		
 		rq->cpu = i;
 		rq->online = 0;
 		rq->idle_stamp = 0;
@@ -8391,8 +8375,6 @@ void __init sched_init(void)
 	set_cpu_rq_start_time();
 #endif
 	init_sched_fair_class();
-
-	init_schedstats();
 
 	scheduler_running = 1;
 }

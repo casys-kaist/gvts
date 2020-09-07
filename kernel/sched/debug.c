@@ -426,7 +426,7 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
 	else
 		SEQ_printf(m, " ");
 
-	SEQ_printf(m, "%15s %5d %9Ld.%06ld %9Ld %5d",
+	SEQ_printf(m, "%15s %5d %9Ld.%06ld %9Ld %5d ",
 		p->comm, task_pid_nr(p),
 		SPLIT_NS(p->se.vruntime),
 		(long long)(p->nvcsw + p->nivcsw),
@@ -440,24 +440,19 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
 #endif /* CONFIG_GVTS */
 #ifdef CONFIG_SCHEDSTATS
 	if (schedstat_enabled()) {
-		SEQ_printf(m, " %9Ld.%06ld %9Ld.%06ld %9Ld.%06ld",
+		SEQ_printf(m, "%9Ld.%06ld %9Ld.%06ld %9Ld.%06ld",
 			SPLIT_NS(p->se.statistics.wait_sum),
 			SPLIT_NS(p->se.sum_exec_runtime),
 			SPLIT_NS(p->se.statistics.sum_sleep_runtime));
-	} else {
-		SEQ_printf(m, " %9Ld.%06ld %9Ld.%06ld %9Ld.%06ld",
-			0LL, 0L,
-			SPLIT_NS(p->se.sum_exec_runtime),
-			0LL, 0L);
 	}
 #else
-	SEQ_printf(m, " %9Ld.%06ld %9Ld.%06ld %9Ld.%06ld",
+	SEQ_printf(m, "%9Ld.%06ld %9Ld.%06ld %9Ld.%06ld",
 		0LL, 0L,
 		SPLIT_NS(p->se.sum_exec_runtime),
 		0LL, 0L);
 #endif
 #ifdef CONFIG_NUMA_BALANCING
-	SEQ_printf(m, " %4d %10d", task_node(p), task_numa_group_id(p));
+	SEQ_printf(m, " %d %d", task_node(p), task_numa_group_id(p));
 #endif
 #ifdef CONFIG_CGROUP_SCHED
 	SEQ_printf(m, " %s", task_group_path(task_group(p)));
