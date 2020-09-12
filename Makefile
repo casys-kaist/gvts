@@ -1,8 +1,12 @@
 VERSION = 4
 PATCHLEVEL = 6
 SUBLEVEL = 4
-EXTRAVERSION =
+EXTRAVERSION = -gvts
 NAME = Charred Weasel
+
+# To prevent adding plus sign
+LOCALVERSION=
+export LOCALVERSION
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
@@ -392,11 +396,12 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -fno-strict-aliasing -fno-common \
 		   -Werror-implicit-function-declaration \
 		   -Wno-format-security \
-		   -std=gnu89
+		   -std=gnu89 \
+		   -fno-pie
 
 KBUILD_AFLAGS_KERNEL :=
 KBUILD_CFLAGS_KERNEL :=
-KBUILD_AFLAGS   := -D__ASSEMBLY__
+KBUILD_AFLAGS   := -D__ASSEMBLY__ -fno-pie
 KBUILD_AFLAGS_MODULE  := -DMODULE
 KBUILD_CFLAGS_MODULE  := -DMODULE
 KBUILD_LDFLAGS_MODULE := -T $(srctree)/scripts/module-common.lds
