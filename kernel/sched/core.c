@@ -112,6 +112,287 @@ void update_rq_clock(struct rq *rq)
 	update_rq_clock_task(rq, delta);
 }
 
+#ifdef CONFIG_GVTS
+/* remember tasks and related things */
+struct task_runtime_info {
+	u64 sum_exec_runtime;
+};
+
+struct remember_info {
+	struct remember_info *next;
+	struct remember_info *parent;
+	pid_t pid;
+	atomic_t exited; /* 0: not exited, 1: exited, 2: trying to take, 3: taken, 4: safe to delete */
+	pid_t tgid;
+	char comm[TASK_COMM_LEN];
+	u64 walltime;
+	u64 vruntime_init;
+	u64 vruntime_end;
+	u64 sum_exec_runtime;
+#ifdef CONFIG_GVTS_DEBUG_NORMALIZATION
+	unsigned int num_normalization;
+	u64 added_normalization;
+	u64 max_added_normalization;
+#endif
+};
+
+#if CONFIG_64BIT
+typedef s64 pointer_size_t;
+typedef atomic64_t atomic_ptr_t;
+#define atomic_ptr_set(v, new) atomic64_set(v, (long) (new))
+#define atomic_ptr_xchg(v, new) ((void *) (atomic64_xchg(v, (long) (new))))
+#define atomic_ptr_cmpxchg(v, old, new) ((void *) (atomic64_cmpxchg(v, (long) (old), (long) (new))))
+#define atomic_ptr_read(v) ((void *) (atomic64_read(v)))
+#else
+typedef s32 pointer_size_t;
+typedef atomic_t atomic_ptr_t;
+#define atomic_ptr_set(v, new) atomic_set(v, (int) (new))
+#define atomic_ptr_xchg(v, new) ((void *) (atomic_xchg(v, (int) (new))))
+#define atomic_ptr_cmpxchg(v, old, new) ((void *) (atomic_cmpxchg(v, (int) (old), (int) (new))))
+#define atomic_ptr_read(v) ((void *) (atomic_read(v)))
+#endif
+static atomic_ptr_t remember_head = {(pointer_size_t) NULL}; /* head of linked list */
+static atomic_ptr_t remember_now_taken = {(pointer_size_t) NULL}; /* not NULL while get_remembered_info is processing */
+
+static void
+__remember_task_clean(struct remember_info *head) {
+	struct remember_info *prev, *curr, *del;
+	if (atomic_ptr_cmpxchg(&remember_now_taken, NULL, head) != NULL)
+		return;
+
+	prev = head;
+	curr = head->next;
+
+	while (curr) {
+		if (atomic_cmpxchg(&curr->exited, 3, 4) != 3) {
+			prev = curr;
+			curr = curr->next;
+			continue;
+		} 
+
+		del = curr;
+		prev->next = curr->next;
+		curr = curr->next;
+
+		kfree(del);
+	}
+}
+
+/* from syscall, parent == NULL.
+   from fork(), parent != NULL. */
+static int 
+__remember_task_new(struct task_struct *p, struct task_struct *parent) 
+{
+	struct remember_info *new;
+
+	new = kzalloc(sizeof(struct remember_info), GFP_KERNEL);
+	if (!new) {
+		p->remember = NULL;
+		return -ENOMEM;
+	}
+
+	p->remember = new;
+	new->parent = parent ? parent->remember : NULL;
+	new->walltime = READ_ONCE(jiffies);
+	new->vruntime_init = p->se.vruntime; /* this is called after setting p->se.vruntime */
+	atomic_set(&new->exited, 0);
+
+	new->next = atomic_ptr_xchg(&remember_head, new);
+
+	if (new->next && atomic_read(&new->next->exited) == 3) {
+		__remember_task_clean(new);
+	}
+
+	return 0;
+}
+
+static void 
+remember_task_fork(struct task_struct *p, struct task_struct *curr) {
+	int ret;
+
+	if (!curr || !curr->remember) {
+		p->remember = NULL;
+		return;
+	}
+
+	ret = __remember_task_new(p, curr);
+	if (unlikely(ret < 0))
+		printk(KERN_ERR "%s: error: %d curr->comm: %s p->comm: %s\n", __func__, ret, curr->comm, p->comm);
+}
+
+static long remember_task_flush(void) {
+	struct remember_info *head = atomic_ptr_xchg(&remember_head, NULL);
+	struct remember_info *curr, *next, *taken_head;
+	int taken_head_passed = 0;
+
+	if (!head)
+		return 0;
+
+	taken_head = atomic_ptr_cmpxchg(&remember_now_taken, NULL, head);
+	
+	curr = head;
+	while (curr) {
+		if (curr == taken_head)
+			taken_head_passed = 1;
+
+		next = curr->next;
+		if (atomic_cmpxchg(&curr->exited, 0, 5) == 0)
+			goto next_task;
+		if (!taken_head_passed)
+			kfree(curr);
+		/* if taken_head_passed, __remember_task_clean() will free the memory */
+next_task:
+		curr = next;
+	}
+
+	if (!taken_head)
+		atomic_ptr_set(&remember_now_taken, NULL);
+	return 0;
+}
+extern void 
+remember_task_exit(struct task_struct *p) {
+	struct remember_info *info = p->remember;
+	int type;
+	unsigned long now;
+
+	if (!info)
+		return;
+
+	now = READ_ONCE(jiffies);
+	info->pid = p->pid;
+	info->tgid = p->tgid;
+	memcpy(info->comm, p->comm, TASK_COMM_LEN);
+	info->vruntime_end = p->se.vruntime;
+	info->walltime = jiffies_to_nsecs(now - (unsigned long) info->walltime);
+	info->sum_exec_runtime = p->se.sum_exec_runtime;
+#ifdef CONFIG_GVTS_DEBUG_NORMALIZATION
+	info->num_normalization = p->se.num_normalization;
+	info->added_normalization = p->se.added_normalization;
+	info->max_added_normalization = p->se.max_added_normalization;
+#endif
+	mb();
+	/* printk(KERN_ERR "task->remember->exited pid: %d comm: %s exited: %d\n",
+						info->pid, info->comm, atomic_read(&info->exited)); */
+	if (atomic_cmpxchg(&info->exited, 0, 1) == 0)
+		return;
+	
+	type = atomic_read(&info->exited);
+	if (type != 5) {
+		printk(KERN_ERR "task->remember->exited is corrupted. pid: %d comm: %s exited: %d\n",
+						info->pid, info->comm, type);
+		return;
+	}
+
+	/* exited == 5, need to free here */
+	kfree(info);
+	return;
+}
+
+static int remember_num_info(void) {
+	int ret = 0;
+	struct remember_info *head, *curr;
+
+	head = atomic_ptr_read(&remember_head);
+	if (!head)
+		return -ENOENT;
+	curr = atomic_ptr_cmpxchg(&remember_now_taken, NULL, head);
+	if (curr)
+		return -EBUSY;
+	
+	for (curr = head; curr; curr = curr->next) {
+		if (atomic_cmpxchg(&curr->exited, 1, 2) == 1)
+			ret++;
+	}
+
+	return ret;
+}
+
+
+static int get_remembered_info(int num_entry, struct remember_info *user) {
+	struct remember_info **array, *prev, *curr, *head;
+	int idx, i, num = 0;
+	int ret = 0, exited;
+	if (num_entry <= 0)
+		return -ENOENT;
+
+	head = atomic_ptr_read(&remember_now_taken);
+	if (!head)
+		return -ENOENT;
+
+	array = kzalloc(sizeof(struct remember_info *) * num_entry, GFP_KERNEL);
+	if (!array)
+		return -ENOMEM;
+
+	prev = NULL;
+	curr = head;
+	while (curr) {
+		exited = atomic_cmpxchg(&curr->exited, 2, 3);
+		//printk(KERN_ERR "%s: num: %d exited: %d\n", __func__, num, exited);
+		if (exited != 2) {
+			prev = curr;
+			curr = curr->next;
+		}
+		
+		if (num >= num_entry) {
+			ret = -EFBIG;
+			goto unlock;
+		}
+
+		array[num++] = curr;
+		if (prev) {
+			/* don't change the prev */
+			atomic_inc(&curr->exited); /* exited = 4: safe to delete */
+			prev->next = curr->next;
+			curr = curr->next;
+		} else {
+			prev = curr;
+			curr = curr->next;
+		}
+	}
+
+	atomic_ptr_set(&remember_now_taken, NULL);
+unlock:
+
+	if (ret < 0)
+		goto free;
+
+	for (idx = 0; idx < num; idx++) {
+		array[idx]->next = (struct remember_info *) (pointer_size_t) idx;
+		if (!array[idx]->parent) {
+			array[idx]->parent = (struct remember_info *) (pointer_size_t) -1;
+			goto copy;
+		}
+
+		for (i = 0; i < num; i++) {
+			if (array[idx]->parent == array[i])
+				break;
+		}
+		/* if parent have not ended yet, parent = #entries. */
+		array[idx]->parent = (struct remember_info *) (pointer_size_t) i;
+
+copy:
+		if (copy_to_user(user, array[idx], sizeof(struct remember_info))) {
+			ret = -EFAULT;
+			goto free;
+		}
+
+		user++; /* next element */
+	}
+
+	/* normal return */
+	ret = num;
+
+free:
+	for (idx = 0; idx < num; idx++) {
+		if (atomic_read(&array[idx]->exited) == 4)
+			kfree(array[idx]);
+	}
+	kfree(array);
+
+	return ret;
+}
+#endif /* CONFIG_GVTS */
+
 /*
  * Debugging: various feature bits
  */
@@ -734,10 +1015,19 @@ int tg_nop(struct task_group *tg, void *data)
 }
 #endif
 
+#ifdef CONFIG_GVTS
+void update_tg_load_sum(struct sched_entity *se, struct task_group *tg, 
+						unsigned long old, unsigned long new, 
+						int no_update_if_zero); 
+#endif
+
 static void set_load_weight(struct task_struct *p)
 {
 	int prio = p->static_prio - MAX_RT_PRIO;
 	struct load_weight *load = &p->se.load;
+#ifdef CONFIG_GVTS
+	unsigned long old_weight = load->weight;
+#endif
 
 	/*
 	 * SCHED_IDLE tasks get minimal weight:
@@ -750,6 +1040,16 @@ static void set_load_weight(struct task_struct *p)
 
 	load->weight = scale_load(sched_prio_to_weight[prio]);
 	load->inv_weight = sched_prio_to_wmult[prio];
+#ifdef CONFIG_GVTS
+	if (p->sched_class == &fair_sched_class) {
+		p->se.eff_load.weight = 0;
+		p->se.eff_load.inv_weight = 0;
+		p->se.eff_weight_real = 0;
+		p->se.lagged_weight = 0;
+		update_tg_load_sum(&p->se, p->sched_task_group, 
+				old_weight, load->weight, TG_LOAD_SUM_CHANGE);
+	}
+#endif
 }
 
 static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
@@ -1891,7 +2191,6 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
 		return;
 	}
 #endif
-
 	raw_spin_lock(&rq->lock);
 	cookie = lockdep_pin_lock(&rq->lock);
 	ttwu_do_activate(rq, p, wake_flags, cookie);
@@ -2201,6 +2500,13 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->on_rq			= 0;
 
 	p->se.on_rq			= 0;
+#ifdef CONFIG_GVTS
+	p->se.eff_load.weight = 0; /* Not yet set. This is context dependent value. */
+	p->se.eff_load.inv_weight = 0;
+	p->se.curr_child = NULL; /* always NULL for leaf sched_entity */
+	p->se.eff_weight_real = 0;
+	p->se.lagged_weight = 0;
+#endif /* CONFIG_GVTS */
 	p->se.exec_start		= 0;
 	p->se.sum_exec_runtime		= 0;
 	p->se.prev_sum_exec_runtime	= 0;
@@ -2210,11 +2516,24 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	p->se.cfs_rq			= NULL;
-#endif
+#ifdef CONFIG_GVTS_BANDWIDTH
+	p->se.state_q = NULL;
+	INIT_LIST_HEAD(&p->se.state_node);
+#endif /* CONFIG_GVTS_BANDWIDTH */
+#endif /* CONFIG_FAIR_GROUP_SCHED */
 
 #ifdef CONFIG_SCHEDSTATS
 	/* Even if schedstat is disabled, there should not be garbage */
 	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
+#endif
+
+#ifdef CONFIG_GVTS
+	p->se.tg_load_sum_contrib = 0;
+#endif
+#ifdef CONFIG_GVTS_DEBUG_NORMALIZATION
+	p->se.num_normalization = 0;
+	p->se.added_normalization = 0;
+	p->se.max_added_normalization = 0;
 #endif
 
 	RB_CLEAR_NODE(&p->dl.rb_node);
@@ -2315,7 +2634,6 @@ static int __init setup_schedstats(char *str)
 	int ret = 0;
 	if (!str)
 		goto out;
-
 	/*
 	 * This code is called before jump labels have been set up, so we can't
 	 * change the static branch directly just yet.  Instead set a temporary
@@ -2435,6 +2753,9 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	if (p->sched_class->task_fork)
 		p->sched_class->task_fork(p);
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+#ifdef CONFIG_GVTS
+	remember_task_fork(p, current);
+#endif
 
 #ifdef CONFIG_SCHED_INFO
 	if (likely(sched_info_on()))
@@ -3293,6 +3614,11 @@ again:
 	BUG(); /* the idle class will always have a runnable task */
 }
 
+#ifdef CONFIG_GVTS
+void transit_busy_to_idle(struct rq *rq);
+void transit_idle_to_busy(struct rq *rq);
+#endif
+
 /*
  * __schedule() is the main scheduler function.
  *
@@ -3399,7 +3725,10 @@ static void __sched notrace __schedule(bool preempt)
 		rq->nr_switches++;
 		rq->curr = next;
 		++*switch_count;
-
+#ifdef CONFIG_GVTS
+		if (unlikely(next == rq->idle && rq->cfs.was_idle == CFS_RQ_WAS_BUSY))
+			transit_busy_to_idle(rq);
+#endif
 		trace_sched_switch(preempt, prev, next);
 		rq = context_switch(rq, prev, next, cookie); /* unlocks the rq */
 	} else {
@@ -5188,6 +5517,193 @@ out_unlock:
 	return retval;
 }
 
+#ifdef CONFIG_GVTS
+static int do_remember_task(pid_t pid) {
+	struct task_struct *p; 
+	long retval;
+	
+	if (pid < 0)
+		return -EINVAL;
+
+	retval = -ESRCH;
+
+	rcu_read_lock();
+	if (pid == 0)
+		p = current;
+	else {
+		p = find_process_by_pid(pid);
+		if (!p)
+			goto out_unlock;
+	}
+
+	get_task_struct(p);
+	retval = __remember_task_new(p, NULL);
+	put_task_struct(p);
+
+out_unlock:
+	rcu_read_unlock();
+	
+	return retval;
+}
+
+/* rcu_read_lock should be held in caller */
+static void __do_get_task_runtime(struct task_struct *p, struct task_runtime_info *info)
+{
+	struct task_struct *t = p;
+	struct task_struct *pos;
+	int init_tid = 0;
+
+	do {
+		get_task_struct(t);
+		/* to prevent infinite loop bug */
+		if (unlikely(init_tid == 0))
+			init_tid = t->pid;
+		else if (unlikely(init_tid == t->pid)) {
+			put_task_struct(t);
+			return;
+		}
+
+		info->sum_exec_runtime += t->se.sum_exec_runtime;	
+
+		if (!list_empty(&t->children)) {
+			int init_child_tid = 0;
+			/* traverse children */
+			list_for_each_entry_rcu(pos, &t->children, sibling) {
+				get_task_struct(pos);
+				/* to prevent infinite loop bug */
+				if (unlikely(init_child_tid == 0))
+					init_child_tid = pos->pid;
+				else if (unlikely(init_child_tid == pos->pid)) {
+					put_task_struct(pos);
+					put_task_struct(t);
+					return;
+				}
+				__do_get_task_runtime(pos, info);
+				put_task_struct(pos);
+			}
+		}
+		put_task_struct(t);
+	} while_each_thread(p, t);
+}
+
+static long do_get_task_runtime(pid_t pid, void __user * __info)
+{
+	struct task_runtime_info info;
+	struct task_struct *p; 
+	long retval;
+	
+	if (pid < 0)
+		return -EINVAL;
+
+	memset(&info, 0, sizeof(struct task_runtime_info));
+
+	retval = -ESRCH;
+
+	preempt_disable();
+	local_irq_disable();
+
+	rcu_read_lock();
+	if (pid == 0)
+		p = current;
+	else {
+		p = find_process_by_pid(pid);
+		if (!p)
+			goto out_unlock;
+	}
+
+	__do_get_task_runtime(p, &info); 
+	retval = 0;
+
+out_unlock:
+	rcu_read_unlock();
+	
+	local_irq_enable();
+	preempt_enable();
+
+	if (retval)
+		return retval;
+
+	if (copy_to_user(__info, &info, sizeof(struct task_runtime_info)))
+		return -EFAULT;
+
+	return 0;
+}
+#endif /* CONFIG_GVTS */
+
+/* Definition of operations of gvts system call */
+#define SET_FAST_CORE               0 /* obsolute */
+#define SET_SLOW_CORE               1 /* obsolute */
+#define SET_UNIT_VRUNTIME	        2 /* obsolute */
+#define GET_THREADS_INFO            3 /* obsolute */
+#define START_MEASURING_IPS_TYPE    4 /* obsolute */
+#define STOP_MEASURING_IPS_TYPE     5 /* obsolute */
+#define CORE_PINNING                6 /* obsolute */
+#define GET_TASK_RUNTIME			7
+#define REMEMBER_TASK				13
+#define GET_REMEMBERED_INFO			14
+/**
+ * sys_gvts - set/change the gvts related things, especially for gvts_amp
+ * @op: the operation id
+ * @id: cpu id or pid, mostly
+ * @num: a number, e.g., unit_vruntime
+ * @vars: a user space pointer for large parameter
+ */
+SYSCALL_DEFINE4(gvts, int, op, int, id, u64, num, void __user *, vars)
+{
+	switch(op) {
+#ifdef CONFIG_GVTS
+		/* for compatibility */
+	case SET_FAST_CORE:
+	case SET_SLOW_CORE:
+	case SET_UNIT_VRUNTIME:
+	case GET_THREADS_INFO:
+	case START_MEASURING_IPS_TYPE:
+	case STOP_MEASURING_IPS_TYPE:
+	case CORE_PINNING:
+			/* obsolete operations */
+			return -EINVAL;
+
+	case GET_TASK_RUNTIME:
+			/* return the info of the task whose pid is @id.
+			 * if id == 0, return the info of the current task.
+			 * The info include vruntime, sum_exec_runtime, sum_perf_runtime, and sum_type_runtime[].
+			 * See the struct task_runtime_info 
+			 */
+			if (num || !vars)
+				return -EINVAL;
+			return do_get_task_runtime(id, vars);
+
+	case REMEMBER_TASK:
+			if (num || vars)
+				return -EINVAL;
+			return do_remember_task(id);
+
+	case GET_REMEMBERED_INFO:
+			/* id == 0: flush the remembered info
+			 * id == 1: return the number of entires remembered
+			 * id == 2: copy the information to @vars
+			 */
+			if (id == 0) {
+				if (num || vars)
+					return -EINVAL;
+				return remember_task_flush();
+			} else if (id == 1) {
+				if (num || vars)
+					return -EINVAL;
+				return remember_num_info();
+			} else if (id == 2) {
+				if (!num || !vars)
+					return -EINVAL;
+				return get_remembered_info(num, vars);
+			} else
+				return -EINVAL;
+
+#endif /* CONFIG_GVTS */	
+	default: /* invalid operation */
+		return -EINVAL;
+	}
+}
+
 static const char stat_nam[] = TASK_STATE_TO_CHAR_STR;
 
 void sched_show_task(struct task_struct *p)
@@ -6044,14 +6560,50 @@ static void update_top_cache_domain(int cpu)
 	rcu_assign_pointer(per_cpu(sd_asym, cpu), sd);
 }
 
-/*
- * Attach the domain 'sd' to 'cpu' as its base domain. Callers must
- * hold the hotplug lock.
- */
+#ifdef CONFIG_GVTS
+/* @sd: sched domain which will be assigned to rq->sd */
 static void
-cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
+cpu_attach_sdv(struct rq *rq, struct sched_domain *sd) {
+	int level = 0;
+	struct sd_vruntime *sdv;
+
+	while (sd && !sd->vruntime)
+		sd = sd->parent;
+	/* Now, @sd is NULL or the lowest sched_domain which has sd_vruntime */
+
+	if (!sd) {
+		rcu_assign_pointer(rq->sd_vruntime, NULL);
+	} else {
+		sdv = sd->vruntime;
+		while (sdv) {
+			sdv->level = level++;
+			sdv = sdv->parent;
+		}
+
+		rcu_assign_pointer(rq->sd_vruntime, sd->vruntime);
+		/* target vruntime cache will be updated at target_vruntime_balance() */
+		/* to manage cfs_rq->lagged, we postpone updating target vruntime cache. */
+		rq->cfs.target_vruntime = 0;
+		rq->cfs.target_interval = sd->vruntime->interval;
+		rq->cfs.was_idle = CFS_RQ_WAS_IDLE;
+		rq->cfs.idle_start = rq_clock(rq);
+		/* initially, nr_busy = 0. That is, all domains are treated as idle. */
+		if (rq->cfs.nr_running) {
+			unsigned long flags;
+			/* However, actually, it's busy... */
+			raw_spin_lock_irqsave(&rq->lock, flags);
+			if (rq->cfs.nr_running) {
+				rq->cfs.was_idle = CFS_RQ_UNINITIALIZED;
+				transit_idle_to_busy(rq);
+			}
+			raw_spin_unlock(&rq->lock);
+		}
+	}
+}
+#endif /* CONFIG_GVTS */
+
+static struct sched_domain *cpu_merge_domain(struct sched_domain *sd, int cpu)
 {
-	struct rq *rq = cpu_rq(cpu);
 	struct sched_domain *tmp;
 
 	/* Remove the sched domains which do not contribute to scheduling. */
@@ -6071,12 +6623,93 @@ cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
 			 */
 			if (parent->flags & SD_PREFER_SIBLING)
 				tmp->flags |= SD_PREFER_SIBLING;
+
+#ifdef CONFIG_GVTS
+			if (parent->vruntime) {
+				struct sd_vruntime *sdv = parent->vruntime; /* to be deleted */
+				struct sd_vruntime *parent_sdv = sdv->parent;
+				struct sd_vruntime *first_child = sdv->child;
+				struct sd_vruntime *last_child = first_child;
+				struct sd_vruntime *prev;
+
+				/* children */
+				if (first_child) {
+					do {
+						last_child->parent = parent_sdv;
+						last_child = last_child->next;
+					} while (last_child != first_child);
+
+				}
+
+				/* parent */
+				if (parent_sdv) {
+					if (parent_sdv->child->next == parent_sdv->child) {
+						/* one element, and it's me */
+						parent_sdv->child = sdv->child;
+					} else {
+						prev = sdv->next;
+						while (prev->next != sdv)
+							prev = prev->next;
+
+						if (first_child) {
+							prev->next = first_child;
+							last_child->next = sdv->next;
+							if (parent_sdv->child == sdv)
+								parent_sdv->child = first_child;
+						} else {
+							prev->next = sdv->next;
+						}
+					}
+
+				}
+
+				/* unlink to prevent removing this entry again
+				   that is, prevent running the code above repeatedly (cause error) */
+				sdv->child = NULL;
+				sdv->parent = NULL;
+
+				atomic_dec(&sdv->ref);
+				parent->vruntime = NULL;
+			}
+#endif /* CONFIG_GVTS */
 			destroy_sched_domain(parent);
 		} else
 			tmp = tmp->parent;
 	}
 
 	if (sd && sd_degenerate(sd)) {
+#ifdef CONFIG_GVTS
+		if (sd->vruntime) {
+			struct sd_vruntime *sdv, *parent_sdv, *prev;
+			sdv = sd->vruntime;
+			parent_sdv = sdv->parent;
+
+			/* parent */
+			if (parent_sdv) {
+				if (parent_sdv->child->next == parent_sdv->child) {
+					/* one element */
+					/* no child at the bottom */
+					parent_sdv->child = NULL;
+				} else {
+					prev = sdv->next;
+					while (prev->next != sdv)
+						prev = prev->next;
+
+					/* no child at the bottom */
+					prev->next = sdv->next;
+
+					if (parent_sdv->child == sdv)
+						parent_sdv->child = sdv->next;
+				}
+			}
+
+			sdv->parent = NULL;
+			sdv->child = NULL;
+
+			atomic_dec(&sdv->ref);
+			sd->vruntime = NULL;
+		}
+#endif /* CONFIG_GVTS */
 		tmp = sd;
 		sd = sd->parent;
 		destroy_sched_domain(tmp);
@@ -6086,8 +6719,24 @@ cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
 
 	sched_domain_debug(sd, cpu);
 
+	return sd;
+}
+
+/*
+ * Attach the domain 'sd' to 'cpu' as its base domain. Callers must
+ * hold the hotplug lock.
+ */
+static void
+cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	struct sched_domain *tmp;
+
 	rq_attach_root(rq, rd);
 	tmp = rq->sd;
+#ifdef CONFIG_GVTS
+	cpu_attach_sdv(rq, sd);
+#endif
 	rcu_assign_pointer(rq->sd, sd);
 	destroy_sched_domains(tmp);
 
@@ -6323,6 +6972,142 @@ build_sched_groups(struct sched_domain *sd, int cpu)
 	return 0;
 }
 
+#ifdef CONFIG_GVTS
+/* show the structure of scheduing domains */
+/* Note that nr_cpumask_bits <= NR_CPUS. refer to include/linux/cpumask.h */
+static char cpu_str[NR_CPUS + 1];
+static char *cpumask_str(const struct cpumask *cpu_map) {
+	int i;
+	for (i = 0; i < nr_cpumask_bits; i++) {
+		cpu_str[i] = cpumask_test_cpu(i, cpu_map) ? '1' : '0';
+	}
+	cpu_str[i] = '\0';
+	return cpu_str;
+}
+
+/* make a sdvruntime covering all cpus and attach it to the highest level sched_domain */
+/* @sd is the lowest sched_domain with sd->flags & SD_OVERLAP */
+static int 
+build_overlap_sd_vruntime(struct sched_domain *sd, int cpu)
+{
+	struct sd_data *sdd, *child_sdd;
+	struct sched_domain *child_sd = sd->child;
+	struct sd_vruntime *sdv;
+	int head_cpu;
+	
+	/* to attach to the highest level */
+	while (sd && sd->parent)
+		sd = sd->parent;
+	sdd = sd->private;
+
+	head_cpu = 0; /* head_cpu is always 0 */
+	sdv = *per_cpu_ptr(sdd->sdv, head_cpu);
+	sd->vruntime = sdv;
+	atomic_inc(&sdv->ref);
+
+	if (cpu != head_cpu) {
+		return 0;
+	}
+
+	/* initialization */
+	atomic_set(&sdv->updated_by, -1);
+	atomic64_set(&sdv->target, sd->vruntime_interval); /* start from the bottom */
+	sdv->interval = sd->vruntime_interval;
+	sdv->tolerance = sd->vruntime_tolerance;
+	sdv->parent = NULL;
+	sdv->next = sdv;
+	sdv->child = NULL;
+	
+	atomic64_set(&sdv->min_target, sd->vruntime_interval);
+	atomic64_set(&sdv->min_child, (long) NULL);
+	
+	atomic_set(&sdv->nr_busy, 0); /* nr_busy will be correctly set at cpu_attach_sdv() */
+	cpumask_copy(sd_vruntime_span(sdv), sched_domain_span(sd)); /* assume that the highest domain spans all cpus */
+	sdv->nr_cpus = cpumask_weight(sd_vruntime_span(sdv));
+
+	if (child_sd) {
+		/* child_head_cpu == head_cpu */
+		child_sdd = (struct sd_data *) (child_sd->private);
+		sdv->child = *per_cpu_ptr(child_sdd->sdv, head_cpu);
+	}
+
+	/* no parents since this sdv covers all cpus */
+	return 0;
+}
+
+/* Assume that sched_domain tree and circular list of groups 
+ * are constructed completely 
+ */
+static int
+build_sd_vruntime(struct sched_domain *sd, int cpu)
+{
+	struct sd_data *sdd = sd->private, *parent_sdd, *child_sdd;
+	struct sched_domain *parent_sd = sd->parent;
+	struct sched_domain *child_sd = sd->child;
+	struct sd_vruntime *sdv;
+	int head_cpu, parent_head_cpu;
+	struct sd_vruntime *last;
+
+	
+
+	head_cpu = cpumask_first(sched_domain_span(sd));
+	sdv = *per_cpu_ptr(sdd->sdv, head_cpu);
+	sd->vruntime = sdv;
+	atomic_inc(&sdv->ref);
+
+	if (cpu != head_cpu)
+		return 0;
+
+	/* initialization */
+	atomic_set(&sdv->updated_by, -1);
+	atomic64_set(&sdv->target, sd->vruntime_interval); /* start from the bottom */
+	sdv->interval = sd->vruntime_interval;
+	sdv->tolerance = sd->vruntime_tolerance;
+	sdv->parent = NULL;
+	sdv->next = sdv;
+	sdv->child = NULL;
+	atomic64_set(&sdv->min_target, sd->vruntime_interval);
+	atomic64_set(&sdv->min_child, (long) NULL);
+	atomic64_set(&sdv->largest_idle_min_vruntime, 0);
+	atomic_set(&sdv->nr_busy, 0); /* nr_busy will be correctly set at cpu_attach_sdv() */
+	cpumask_copy(sd_vruntime_span(sdv), sched_domain_span(sd));
+	sdv->nr_cpus = cpumask_weight(sd_vruntime_span(sdv));
+
+	if (child_sd) {
+		/* child_head_cpu == head_cpu */
+		child_sdd = (struct sd_data *) (child_sd->private);
+		sdv->child = *per_cpu_ptr(child_sdd->sdv, head_cpu);
+	}
+
+	if (!parent_sd)
+		return 0;
+
+	/* set parent and next */
+	if (parent_sd->flags & SD_OVERLAP) {
+		parent_head_cpu = 0;
+		while (parent_sd && parent_sd->parent)
+			parent_sd = parent_sd->parent;
+	} else {
+		parent_head_cpu = cpumask_first(sched_domain_span(parent_sd));
+	}
+
+	parent_sdd = (struct sd_data *) (parent_sd->private);
+	sdv->parent = *per_cpu_ptr(parent_sdd->sdv, parent_head_cpu);
+
+	last = sdv->parent->child;
+	if (last == NULL) {
+		sdv->parent->child = sdv;
+		sdv->next = sdv;
+	} else {
+		while (last->next != sdv->parent->child)
+			last = last->next;
+		last->next = sdv;
+		sdv->next = sdv->parent->child;
+	}
+	return 0;
+}
+#endif
+
 /*
  * Initialize sched groups cpu_capacity.
  *
@@ -6437,6 +7222,10 @@ static void claim_allocations(int cpu, struct sched_domain *sd)
 
 	if (atomic_read(&(*per_cpu_ptr(sdd->sds, cpu))->ref))
 		*per_cpu_ptr(sdd->sds, cpu) = NULL;
+#ifdef CONFIG_GVTS
+	if (atomic_read(&(*per_cpu_ptr(sdd->sdv, cpu))->ref))
+		*per_cpu_ptr(sdd->sdv, cpu) = NULL;
+#endif
 
 	if (atomic_read(&(*per_cpu_ptr(sdd->sg, cpu))->ref))
 		*per_cpu_ptr(sdd->sg, cpu) = NULL;
@@ -6560,11 +7349,23 @@ sd_init(struct sched_domain_topology_level *tl,
 		sd->flags |= SD_PREFER_SIBLING;
 		sd->imbalance_pct = 110;
 		sd->smt_gain = 1178; /* ~15% */
+#ifdef CONFIG_GVTS
+		sd->vruntime_interval = CONFIG_GVTS_INTERVAL_SMT_SHARED * NSEC_PER_MSEC;
+		sd->vruntime_tolerance = CONFIG_GVTS_INTERVAL_SMT_SHARED 
+									* CONFIG_GVTS_TOLERANCE_PERCENT / 100
+									* NSEC_PER_MSEC;
+#endif
 
 	} else if (sd->flags & SD_SHARE_PKG_RESOURCES) {
 		sd->imbalance_pct = 117;
 		sd->cache_nice_tries = 1;
 		sd->busy_idx = 2;
+#ifdef CONFIG_GVTS
+		sd->vruntime_interval = CONFIG_GVTS_INTERVAL_LLC_SHARED * NSEC_PER_MSEC;
+		sd->vruntime_tolerance = CONFIG_GVTS_INTERVAL_LLC_SHARED 
+									* CONFIG_GVTS_TOLERANCE_PERCENT / 100
+									* NSEC_PER_MSEC;
+#endif
 
 #ifdef CONFIG_NUMA
 	} else if (sd->flags & SD_NUMA) {
@@ -6578,6 +7379,19 @@ sd_init(struct sched_domain_topology_level *tl,
 				       SD_BALANCE_FORK |
 				       SD_WAKE_AFFINE);
 		}
+#ifdef CONFIG_GVTS
+		/* according to include/linux/topology.h,
+		 * numa distance is 10 (for local nodes), 20 (for remote nodes), etc.
+		 * We decide to vruntime_interval as 1s, 2s, etc.
+		 */
+		sd->vruntime_interval = CONFIG_GVTS_INTERVAL_NUMA * NSEC_PER_MSEC 
+							* sched_domains_numa_distance[tl->numa_level] / 10;
+		sd->vruntime_tolerance = CONFIG_GVTS_INTERVAL_NUMA 
+							* CONFIG_GVTS_TOLERANCE_PERCENT / 100 /* for tolerance percentage */
+							* NSEC_PER_MSEC 
+							* sched_domains_numa_distance[tl->numa_level] 
+							/ 10; /* for numa distance unit */
+#endif
 
 #endif
 	} else {
@@ -6585,6 +7399,13 @@ sd_init(struct sched_domain_topology_level *tl,
 		sd->cache_nice_tries = 1;
 		sd->busy_idx = 2;
 		sd->idle_idx = 1;
+#ifdef CONFIG_GVTS
+		/* I don't know... just similar to SD_SHARE_PKG_RESOURCES... */
+		sd->vruntime_interval = CONFIG_GVTS_INTERVAL_LLC_SHARED * NSEC_PER_MSEC;
+		sd->vruntime_tolerance = CONFIG_GVTS_INTERVAL_LLC_SHARED 
+									* CONFIG_GVTS_TOLERANCE_PERCENT / 100
+									* NSEC_PER_MSEC;
+#endif
 	}
 
 	/*
@@ -6910,6 +7731,11 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
 		sdd->sds = alloc_percpu(struct sched_domain_shared *);
 		if (!sdd->sds)
 			return -ENOMEM;
+#ifdef CONFIG_GVTS
+		sdd->sdv = alloc_percpu(struct sd_vruntime *);
+		if (!sdd->sdv)
+			return -ENOMEM;
+#endif
 
 		sdd->sg = alloc_percpu(struct sched_group *);
 		if (!sdd->sg)
@@ -6922,6 +7748,9 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
 		for_each_cpu(j, cpu_map) {
 			struct sched_domain *sd;
 			struct sched_domain_shared *sds;
+#ifdef CONFIG_GVTS
+			struct sd_vruntime *sdv;
+#endif
 			struct sched_group *sg;
 			struct sched_group_capacity *sgc;
 
@@ -6939,6 +7768,14 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
 
 			*per_cpu_ptr(sdd->sds, j) = sds;
 
+#ifdef CONFIG_GVTS
+			sdv = kzalloc_node(sizeof(struct sd_vruntime) + cpumask_size(),
+					GFP_KERNEL, cpu_to_node(j));
+			if (!sdv)
+				return -ENOMEM;
+
+			*per_cpu_ptr(sdd->sdv, j) = sdv;
+#endif
 			sg = kzalloc_node(sizeof(struct sched_group) + cpumask_size(),
 					GFP_KERNEL, cpu_to_node(j));
 			if (!sg)
@@ -6980,6 +7817,10 @@ static void __sdt_free(const struct cpumask *cpu_map)
 
 			if (sdd->sds)
 				kfree(*per_cpu_ptr(sdd->sds, j));
+#ifdef CONFIG_GVTS
+			if (sdd->sdv)
+				kfree(*per_cpu_ptr(sdd->sdv, j));
+#endif
 			if (sdd->sg)
 				kfree(*per_cpu_ptr(sdd->sg, j));
 			if (sdd->sgc)
@@ -6989,6 +7830,10 @@ static void __sdt_free(const struct cpumask *cpu_map)
 		sdd->sd = NULL;
 		free_percpu(sdd->sds);
 		sdd->sds = NULL;
+#ifdef CONFIG_GVTS
+		free_percpu(sdd->sdv);
+		sdd->sdv = NULL;
+#endif
 		free_percpu(sdd->sg);
 		sdd->sg = NULL;
 		free_percpu(sdd->sgc);
@@ -7073,6 +7918,22 @@ static int build_sched_domains(const struct cpumask *cpu_map,
 		}
 	}
 
+#ifdef CONFIG_GVTS
+	/* build sd_vruntime */
+	for_each_cpu(i, cpu_map) {
+		for (sd = *per_cpu_ptr(d.sd, i); sd; sd = sd->parent) {
+			if (sd->flags & SD_OVERLAP) {
+				if (build_overlap_sd_vruntime(sd, i))
+					goto error;
+				break;
+			} else {
+				if (build_sd_vruntime(sd, i))
+					goto error;
+			}
+		}
+	}
+#endif
+
 	/* Calculate CPU capacity for physical packages and nodes */
 	for (i = nr_cpumask_bits-1; i >= 0; i--) {
 		if (!cpumask_test_cpu(i, cpu_map))
@@ -7083,6 +7944,84 @@ static int build_sched_domains(const struct cpumask *cpu_map,
 			init_sched_groups_capacity(i, sd);
 		}
 	}
+
+
+#ifdef CONFIG_GVTS
+#if 0 // To show sdv topology while booting 
+	for_each_cpu(i, cpu_map) {
+		int level = 0;
+		for (sd = *per_cpu_ptr(d.sd, i); sd; sd = sd->parent) {
+			printk(KERN_ERR "[%02d] SDV show name: %4s span: %40s sdv lvl: %2d weight: %2d child: %2d parent: %2d span: %40s ptr: %16p next: %16p child: %16p parent: %16p target: %ld interval: %lld\n", 
+						i, sd->name,
+						cpumask_str(sched_domain_span(sd)),
+						sd->vruntime ? level : -1,
+						sd->vruntime ? sd->vruntime->nr_cpus : -1,
+						sd->vruntime ? sd->vruntime->child ? sd->vruntime->child->nr_cpus : -2 
+									: -1,
+						sd->vruntime ? sd->vruntime->parent ? sd->vruntime->parent->nr_cpus : -2 
+									: -1,
+						sd->vruntime ? cpumask_str(sd_vruntime_span(sd->vruntime)) : "NULL",
+						sd->vruntime,
+						sd->vruntime ? sd->vruntime->next : NULL,
+						sd->vruntime ? sd->vruntime->child : NULL,
+						sd->vruntime ? sd->vruntime->parent : NULL,
+						sd->vruntime ? atomic64_read(&sd->vruntime->target) : -1,
+						sd->vruntime ? sd->vruntime->interval : -1);
+			if (!sd->vruntime)
+				continue;
+			level++;
+		}
+	}
+#endif
+#endif
+
+	/* Clean up the unnecessary domains */
+	for_each_cpu(i, cpu_map) {
+		sd = *per_cpu_ptr(d.sd, i);
+		sd = cpu_merge_domain(sd, i);
+		*per_cpu_ptr(d.sd, i) = sd;
+	}
+
+#ifdef CONFIG_GVTS
+#if 0
+	/* build sd_vruntime */
+	for_each_cpu(i, cpu_map) {
+		for (sd = *per_cpu_ptr(d.sd, i); sd; sd = sd->parent) {
+			if (sd->flags & SD_OVERLAP) {
+				if (build_overlap_sd_vruntime(sd, i))
+					goto error;
+				break;
+			} else {
+				if (build_sd_vruntime(sd, i))
+					goto error;
+			}
+		}
+	}
+#endif
+	for_each_cpu(i, cpu_map) {
+		int level = 0;
+		for (sd = *per_cpu_ptr(d.sd, i); sd; sd = sd->parent) {
+//#if 0 // To show sdv topology while booting 
+			printk(KERN_ERR "[%02d] sched_domain_vruntime name: %4s level: %2d weight: %2d child: %2d parent: %2d span: %40s ptr: %16p next: %16p child: %16p parent: %16p\n", 
+						i, sd->name,
+						sd->vruntime ? level : -1,
+						sd->vruntime ? sd->vruntime->nr_cpus : -1,
+						sd->vruntime ? sd->vruntime->child ? sd->vruntime->child->nr_cpus : -2 
+									: -1,
+						sd->vruntime ? sd->vruntime->parent ? sd->vruntime->parent->nr_cpus : -2 
+									: -1,
+						sd->vruntime ? cpumask_str(sd_vruntime_span(sd->vruntime)) : "NULL",
+						sd->vruntime,
+						sd->vruntime ? sd->vruntime->next : NULL,
+						sd->vruntime ? sd->vruntime->child : NULL,
+						sd->vruntime ? sd->vruntime->parent : NULL);
+//#endif
+			if (!sd->vruntime)
+				continue;
+			level++;
+		}
+	}
+#endif
 
 	/* Attach the domains */
 	rcu_read_lock();
@@ -7104,6 +8043,35 @@ static int build_sched_domains(const struct cpumask *cpu_map,
 	}
 
 	ret = 0;
+
+#ifdef CONFIG_GVTS
+#if 0 // To show sdv topology while booting 
+	for_each_cpu(i, cpu_map) {
+		for (sd = *per_cpu_ptr(d.sd, i); sd; sd = sd->parent) {
+			printk(KERN_ERR "[%02d] SDV show name: %4s span: %40s sdv lvl: %2d weight: %2d child: %2d parent: %2d span: %40s ptr: %16p next: %16p child: %16p parent: %16p target: %ld interval: %lld\n", 
+						i, sd->name,
+						cpumask_str(sched_domain_span(sd)),
+						sd->vruntime ? sd->vruntime->level : -1,
+						sd->vruntime ? sd->vruntime->nr_cpus : -1,
+						sd->vruntime ? sd->vruntime->child ? sd->vruntime->child->nr_cpus : -2 
+									: -1,
+						sd->vruntime ? sd->vruntime->parent ? sd->vruntime->parent->nr_cpus : -2 
+									: -1,
+						sd->vruntime ? cpumask_str(sd_vruntime_span(sd->vruntime)) : "NULL",
+						sd->vruntime,
+						sd->vruntime ? sd->vruntime->next : NULL,
+						sd->vruntime ? sd->vruntime->child : NULL,
+						sd->vruntime ? sd->vruntime->parent : NULL,
+						sd->vruntime ? atomic64_read(&sd->vruntime->target) : -1,
+						sd->vruntime ? sd->vruntime->interval : -1);
+			if (!sd->vruntime)
+				continue;
+		}
+	}
+#endif
+#endif
+
+
 error:
 	__free_domain_allocs(&d, alloc_state, cpu_map);
 	return ret;
@@ -7674,11 +8642,16 @@ void __init sched_init(void)
 #ifdef CONFIG_SMP
 		rq->sd = NULL;
 		rq->rd = NULL;
+#ifdef CONFIG_GVTS
+		rq->sd_vruntime = NULL;
+		rq->infeasible_weight = 0;
+#endif
 		rq->cpu_capacity = rq->cpu_capacity_orig = SCHED_CAPACITY_SCALE;
 		rq->balance_callback = NULL;
 		rq->active_balance = 0;
 		rq->next_balance = jiffies;
 		rq->push_cpu = 0;
+		
 		rq->cpu = i;
 		rq->online = 0;
 		rq->idle_stamp = 0;

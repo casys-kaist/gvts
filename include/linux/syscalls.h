@@ -902,5 +902,8 @@ asmlinkage long sys_pkey_mprotect(unsigned long start, size_t len,
 				  unsigned long prot, int pkey);
 asmlinkage long sys_pkey_alloc(unsigned long flags, unsigned long init_val);
 asmlinkage long sys_pkey_free(int pkey);
+#ifdef CONFIG_GVTS_SYSCALL
+asmlinkage long sys_gvts(int op, int id, u64 num, void __user *vars);
+#endif
 
 #endif

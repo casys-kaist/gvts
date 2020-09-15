@@ -406,6 +406,18 @@ ip6t_do_table(struct sk_buff *skb,
 	else return verdict;
 }
 
+static bool find_jump_target(const struct xt_table_info *t,
+			     const struct ip6t_entry *target)
+{
+	struct ip6t_entry *iter;
+
+	xt_entry_foreach(iter, t->entries, t->size) {
+		 if (iter == target)
+			return true;
+	}
+	return false;
+}
+
 /* Figures out from what hook each rule can be called: returns 0 if
    there are loops.  Puts hook bitmask in comefrom. */
 static int

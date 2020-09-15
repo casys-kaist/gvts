@@ -190,6 +190,14 @@ pte_t huge_ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
 	maybe_tlb_batch_add(mm, addr, ptep, entry, 0);
 	maybe_tlb_batch_add(mm, addr + REAL_HPAGE_SIZE, ptep, entry, 0);
 
+	/* Issue TLB flush at REAL_HPAGE_SIZE boundaries */
+	addr -= REAL_HPAGE_SIZE;
+	ptep -= nptes / 2;
+	maybe_tlb_batch_add(mm, addr, ptep, entry, 0);
+	addr -= REAL_HPAGE_SIZE;
+	ptep -= nptes / 2;
+	maybe_tlb_batch_add(mm, addr, ptep, entry, 0);
+
 	return entry;
 }
 
