@@ -73,35 +73,6 @@ static void alx_free_txbuf(struct alx_priv *alx, int entry)
 	}
 }
 
-static struct sk_buff *alx_alloc_skb(struct alx_priv *alx, gfp_t gfp)
-{
-	struct sk_buff *skb;
-	struct page *page;
-
-	if (alx->rx_frag_size > PAGE_SIZE)
-		return __netdev_alloc_skb(alx->dev, alx->rxbuf_size, gfp);
-
-	page = alx->rx_page;
-	if (!page) {
-		alx->rx_page = page = alloc_page(gfp);
-		if (unlikely(!page))
-			return NULL;
-		alx->rx_page_offset = 0;
-	}
-
-	skb = build_skb(page_address(page) + alx->rx_page_offset,
-			alx->rx_frag_size);
-	if (likely(skb)) {
-		alx->rx_page_offset += alx->rx_frag_size;
-		if (alx->rx_page_offset >= PAGE_SIZE)
-			alx->rx_page = NULL;
-		else
-			get_page(page);
-	}
-	return skb;
-}
-
-
 static int alx_refill_rx_ring(struct alx_priv *alx, gfp_t gfp)
 {
 	struct alx_rx_queue *rxq = &alx->rxq;
