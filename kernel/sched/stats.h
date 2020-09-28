@@ -55,6 +55,16 @@ rq_sched_info_depart(struct rq *rq, unsigned long long delta)
 #define schedstat_val_or_zero(var)	0
 #endif /* CONFIG_SCHEDSTATS */
 
+#ifdef CONFIG_GVTS_STATS /* depends on CONFIG_SCHEDSTATS */
+# define gvts_stat_inc(rq, field)	do { if (schedstat_enabled()) { (rq)->field++; } } while (0)
+# define gvts_stat_add(rq, field, amt)	do { if (schedstat_enabled()) { (rq)->field += (amt); } } while (0)
+# define gvts_stat_set(var, val)	do { if (schedstat_enabled()) { var = (val); } } while (0)
+#else
+# define gvts_stat_inc(rq, field)	do { } while (0)
+# define gvts_stat_add(rq, field, amt)	do { } while (0)
+# define gvts_stat_set(var, val)	do { } while (0)
+#endif
+
 #ifdef CONFIG_SCHED_INFO
 static inline void sched_info_reset_dequeued(struct task_struct *t)
 {

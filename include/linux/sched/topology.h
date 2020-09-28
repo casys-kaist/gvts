@@ -79,6 +79,11 @@ struct sched_domain {
 	struct sched_domain *parent;	/* top domain must be null terminated */
 	struct sched_domain *child;	/* bottom domain must be null terminated */
 	struct sched_group *groups;	/* the balancing groups of the domain */
+#ifdef CONFIG_GVTS
+	struct sd_vruntime *vruntime; /* the balancing criteria of GVTS */
+	u64 vruntime_interval;
+	u64 vruntime_tolerance;
+#endif /* CONFIG_GVTS */
 	unsigned long min_interval;	/* Minimum balance interval ms */
 	unsigned long max_interval;	/* Maximum balance interval ms */
 	unsigned int busy_factor;	/* less balancing by factor if busy */
@@ -107,6 +112,51 @@ struct sched_domain {
 	u64 avg_scan_cost;		/* select_idle_sibling */
 
 #ifdef CONFIG_SCHEDSTATS
+#ifdef CONFIG_GVTS_STATS
+	/* _target_vruntime_balance() */
+	unsigned int target_update_racing;
+	/* __target_vruntime_balance() */
+	unsigned int tb_count[CPU_MAX_IDLE_TYPES];
+	unsigned int tb_nolaggedgroup[CPU_MAX_IDLE_TYPES];
+	unsigned int tb_nolaggedcpu[CPU_MAX_IDLE_TYPES];
+	unsigned int tb_gained[CPU_MAX_IDLE_TYPES];
+	unsigned int tb_all_pinned_but_running[CPU_MAX_IDLE_TYPES];
+	/* _target_vruntime_balance() */
+	unsigned int tvb_count[CPU_MAX_IDLE_TYPES];
+	unsigned int tvb_not_reach[CPU_MAX_IDLE_TYPES];
+	unsigned int tvb_idle_continue[CPU_MAX_IDLE_TYPES];
+	unsigned int tvb_stay[CPU_MAX_IDLE_TYPES];
+	unsigned int tvb_not_update[CPU_MAX_IDLE_TYPES];
+	unsigned int tvb_update_target[CPU_MAX_IDLE_TYPES];
+	unsigned int tvb_pull_count[CPU_MAX_IDLE_TYPES];
+	unsigned int tvb_pull_gained[CPU_MAX_IDLE_TYPES];
+	unsigned int tvb_pull_no_gain[CPU_MAX_IDLE_TYPES];
+	/* find_most_lagged_cpu() */
+	unsigned int lagged_count[CPU_MAX_IDLE_TYPES];
+	unsigned int lagged_little_tasks[CPU_MAX_IDLE_TYPES];
+	unsigned int lagged_no_cfs_tasks[CPU_MAX_IDLE_TYPES];
+	unsigned int lagged_pass_soon[CPU_MAX_IDLE_TYPES];
+	unsigned int lagged_not_min[CPU_MAX_IDLE_TYPES];
+	unsigned int lagged_found[CPU_MAX_IDLE_TYPES];
+	/* detach_lagged_tasks() */
+	unsigned int detach_count[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_neg_diff[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_loop_stop[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_task_count[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_task_cannot[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_task_not_lag[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_task_too_lag[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_complete[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_task_detach[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_task_too_detach[CPU_MAX_IDLE_TYPES];
+	unsigned int detach_task_not_detach[CPU_MAX_IDLE_TYPES];
+	unsigned int atb_count;
+	unsigned int atb_failed;
+	unsigned int atb_pushed;
+	unsigned int atb_pushed_under;
+	unsigned int target_diff[NUM_MAX_TARGET_DIFF];
+#endif /* CONFIG_GVTS_STATS */
+
 	/* load_balance() stats */
 	unsigned int lb_count[CPU_MAX_IDLE_TYPES];
 	unsigned int lb_failed[CPU_MAX_IDLE_TYPES];
@@ -181,6 +231,9 @@ struct sd_data {
 	struct sched_domain_shared *__percpu *sds;
 	struct sched_group *__percpu *sg;
 	struct sched_group_capacity *__percpu *sgc;
+#ifdef CONFIG_GVTS
+	struct sd_vruntime **__percpu sdv;
+#endif
 };
 
 struct sched_domain_topology_level {
