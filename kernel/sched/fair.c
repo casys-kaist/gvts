@@ -4304,6 +4304,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	update_curr(cfs_rq);
 
+#ifndef CONFIG_GVTS /* for GVTS, do not normalize vruntime based on min_vruntime */
 	/*
 	 * Otherwise, renormalise after, such that we're placed at the current
 	 * moment in time, instead of some random moment in the past. Being
@@ -4312,6 +4313,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 */
 	if (renorm && !curr)
 		se->vruntime += cfs_rq->min_vruntime;
+#endif /* !CONFIG_GVTS */
 
 	/*
 	 * When enqueuing a sched_entity, we must:
