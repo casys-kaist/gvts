@@ -1293,4 +1293,8 @@ static inline unsigned int ksys_personality(unsigned int personality)
 	return old;
 }
 
+#ifdef CONFIG_GVTS_SYSCALL
+asmlinkage long sys_gvts(int op, int id, u64 num, void __user *vars);
+#endif
+
 #endif

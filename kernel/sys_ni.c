@@ -161,6 +161,7 @@ COND_SYSCALL(syslog);
 /* kernel/ptrace.c */
 
 /* kernel/sched/core.c */
+COND_SYSCALL(sys_gvts);
 
 /* kernel/signal.c */
 

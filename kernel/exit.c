@@ -767,6 +767,10 @@ static void check_stack_usage(void)
 static inline void check_stack_usage(void) {}
 #endif
 
+#ifdef CONFIG_GVTS
+void remember_task_exit(struct task_struct *p);
+#endif
+
 void __noreturn do_exit(long code)
 {
 	struct task_struct *tsk = current;
@@ -778,6 +782,10 @@ void __noreturn do_exit(long code)
 	 * Then fix up important state like USER_DS and preemption.
 	 * Then do everything else.
 	 */
+
+#ifdef CONFIG_GVTS
+	remember_task_exit(tsk);
+#endif
 
 	WARN_ON(blk_needs_flush_plug(tsk));
 
