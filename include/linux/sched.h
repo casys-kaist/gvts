@@ -2,6 +2,10 @@
 #ifndef _LINUX_SCHED_H
 #define _LINUX_SCHED_H
 
+#ifdef CONFIG_GVTS_STATS
+#define NUM_MAX_TARGET_DIFF 10
+#endif
+
 /*
  * Define 'struct task_struct' and provide the main scheduler
  * APIs (schedule(), wakeup variants, etc.)
@@ -405,6 +409,10 @@ struct sched_avg {
 	struct util_est			util_est;
 } ____cacheline_aligned;
 
+#ifdef CONFIG_GVTS
+struct remember_info;
+#endif
+
 struct sched_statistics {
 #ifdef CONFIG_SCHEDSTATS
 	u64				wait_start;
@@ -452,6 +460,17 @@ struct sched_entity {
 	u64				exec_start;
 	u64				sum_exec_runtime;
 	u64				vruntime;
+#ifdef CONFIG_GVTS
+	u64			sleep_start; /* remember the sleep start time
+								to prevent vruntime normalization for short sleep */
+	u64			sleep_target; /* remember the target when start to sleep
+	                             for vruntime normalization */
+#endif /* CONFIG_GVTS */
+#ifdef CONFIG_GVTS_DEBUG_NORMALIZATION /* for debug */
+	unsigned int num_normalization;
+	u64 added_normalization;
+	u64 max_added_normalization;
+#endif
 	u64				prev_sum_exec_runtime;
 
 	u64				nr_migrations;
@@ -465,6 +484,11 @@ struct sched_entity {
 	struct cfs_rq			*cfs_rq;
 	/* rq "owned" by this entity/group: */
 	struct cfs_rq			*my_q;
+#ifdef CONFIG_GVTS_BANDWIDTH
+	struct list_head	*state_q; /* refer to active_q or throt_q.
+									NULL while running */
+	struct list_head	state_node; /* node inserted to active_q or throt_q */ 
+#endif
 #endif
 
 #ifdef CONFIG_SMP
@@ -476,6 +500,19 @@ struct sched_entity {
 	 */
 	struct sched_avg		avg;
 #endif
+#ifdef CONFIG_GVTS
+	struct load_weight eff_load;	/* for vruntime update */
+	struct sched_entity *curr_child; /* for update effective_load */
+	unsigned long eff_weight_real; /* NOT affected by MIN_SHARES and MAX_SHARES */
+	unsigned long lagged_weight; /* To calculcate @lagged.
+									eff_weight_real * util_avg >> SCALE
+									or 
+									eff_weight_real * util_avg << ADDED_BITS / efficiency[rq->cpu_type]
+									*/
+	s64 lagged; /* necessary time to reach se->vruntime to lagged_target */
+	u64 lagged_target; /* target used when calculating @lagged. */
+	unsigned long tg_load_sum_contrib;
+#endif /* CONFIG_GVTS */
 };
 
 struct sched_rt_entity {
@@ -787,6 +824,9 @@ struct task_struct {
 
 	pid_t				pid;
 	pid_t				tgid;
+#ifdef CONFIG_GVTS
+	struct remember_info *remember;
+#endif
 
 #ifdef CONFIG_STACKPROTECTOR
 	/* Canary value for the -fstack-protector GCC feature: */

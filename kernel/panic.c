@@ -156,6 +156,10 @@ static void panic_print_sys_info(void)
 		ftrace_dump(DUMP_ALL);
 }
 
+#ifdef CONFIG_GVTS
+void dump_sched(void);
+#endif
+
 /**
  *	panic - halt the system
  *	@fmt: The text string to print
@@ -219,6 +223,9 @@ void panic(const char *fmt, ...)
 	 */
 	if (!test_taint(TAINT_DIE) && oops_in_progress <= 1)
 		dump_stack();
+#ifdef CONFIG_GVTS
+		dump_sched();
+#endif
 #endif
 
 	/*

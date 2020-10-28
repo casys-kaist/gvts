@@ -708,10 +708,18 @@ static void check_stack_usage(void)
 static inline void check_stack_usage(void) {}
 #endif
 
+#ifdef CONFIG_GVTS
+void remember_task_exit(struct task_struct *p);
+#endif
+
 void __noreturn do_exit(long code)
 {
 	struct task_struct *tsk = current;
 	int group_dead;
+
+#ifdef CONFIG_GVTS
+	remember_task_exit(tsk);
+#endif
 
 	/*
 	 * We can get here from a kernel oops, sometimes with preemption off.

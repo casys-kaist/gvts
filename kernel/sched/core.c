@@ -36,6 +36,287 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_overutilized_tp);
 
 DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
 
+#ifdef CONFIG_GVTS
+/* remember tasks and related things */
+struct task_runtime_info {
+	u64 sum_exec_runtime;
+};
+
+struct remember_info {
+	struct remember_info *next;
+	struct remember_info *parent;
+	pid_t pid;
+	atomic_t exited; /* 0: not exited, 1: exited, 2: trying to take, 3: taken, 4: safe to delete */
+	pid_t tgid;
+	char comm[TASK_COMM_LEN];
+	u64 walltime;
+	u64 vruntime_init;
+	u64 vruntime_end;
+	u64 sum_exec_runtime;
+#ifdef CONFIG_GVTS_DEBUG_NORMALIZATION
+	unsigned int num_normalization;
+	u64 added_normalization;
+	u64 max_added_normalization;
+#endif
+};
+
+#if CONFIG_64BIT
+typedef s64 pointer_size_t;
+typedef atomic64_t atomic_ptr_t;
+#define atomic_ptr_set(v, new) atomic64_set(v, (long) (new))
+#define atomic_ptr_xchg(v, new) ((void *) (atomic64_xchg(v, (long) (new))))
+#define atomic_ptr_cmpxchg(v, old, new) ((void *) (atomic64_cmpxchg(v, (long) (old), (long) (new))))
+#define atomic_ptr_read(v) ((void *) (atomic64_read(v)))
+#else
+typedef s32 pointer_size_t;
+typedef atomic_t atomic_ptr_t;
+#define atomic_ptr_set(v, new) atomic_set(v, (int) (new))
+#define atomic_ptr_xchg(v, new) ((void *) (atomic_xchg(v, (int) (new))))
+#define atomic_ptr_cmpxchg(v, old, new) ((void *) (atomic_cmpxchg(v, (int) (old), (int) (new))))
+#define atomic_ptr_read(v) ((void *) (atomic_read(v)))
+#endif
+static atomic_ptr_t remember_head = {(pointer_size_t) NULL}; /* head of linked list */
+static atomic_ptr_t remember_now_taken = {(pointer_size_t) NULL}; /* not NULL while get_remembered_info is processing */
+
+static void
+__remember_task_clean(struct remember_info *head) {
+	struct remember_info *prev, *curr, *del;
+	if (atomic_ptr_cmpxchg(&remember_now_taken, NULL, head) != NULL)
+		return;
+
+	prev = head;
+	curr = head->next;
+
+	while (curr) {
+		if (atomic_cmpxchg(&curr->exited, 3, 4) != 3) {
+			prev = curr;
+			curr = curr->next;
+			continue;
+		} 
+
+		del = curr;
+		prev->next = curr->next;
+		curr = curr->next;
+
+		kfree(del);
+	}
+}
+
+/* from syscall, parent == NULL.
+   from fork(), parent != NULL. */
+static int 
+__remember_task_new(struct task_struct *p, struct task_struct *parent) 
+{
+	struct remember_info *new;
+
+	new = kzalloc(sizeof(struct remember_info), GFP_KERNEL);
+	if (!new) {
+		p->remember = NULL;
+		return -ENOMEM;
+	}
+
+	p->remember = new;
+	new->parent = parent ? parent->remember : NULL;
+	new->walltime = READ_ONCE(jiffies);
+	new->vruntime_init = p->se.vruntime; /* this is called after setting p->se.vruntime */
+	atomic_set(&new->exited, 0);
+
+	new->next = atomic_ptr_xchg(&remember_head, new);
+
+	if (new->next && atomic_read(&new->next->exited) == 3) {
+		__remember_task_clean(new);
+	}
+
+	return 0;
+}
+
+static void 
+remember_task_fork(struct task_struct *p, struct task_struct *curr) {
+	int ret;
+
+	if (!curr || !curr->remember) {
+		p->remember = NULL;
+		return;
+	}
+
+	ret = __remember_task_new(p, curr);
+	if (unlikely(ret < 0))
+		printk(KERN_ERR "%s: error: %d curr->comm: %s p->comm: %s\n", __func__, ret, curr->comm, p->comm);
+}
+
+static long remember_task_flush(void) {
+	struct remember_info *head = atomic_ptr_xchg(&remember_head, NULL);
+	struct remember_info *curr, *next, *taken_head;
+	int taken_head_passed = 0;
+
+	if (!head)
+		return 0;
+
+	taken_head = atomic_ptr_cmpxchg(&remember_now_taken, NULL, head);
+	
+	curr = head;
+	while (curr) {
+		if (curr == taken_head)
+			taken_head_passed = 1;
+
+		next = curr->next;
+		if (atomic_cmpxchg(&curr->exited, 0, 5) == 0)
+			goto next_task;
+		if (!taken_head_passed)
+			kfree(curr);
+		/* if taken_head_passed, __remember_task_clean() will free the memory */
+next_task:
+		curr = next;
+	}
+
+	if (!taken_head)
+		atomic_ptr_set(&remember_now_taken, NULL);
+	return 0;
+}
+extern void 
+remember_task_exit(struct task_struct *p) {
+	struct remember_info *info = p->remember;
+	int type;
+	unsigned long now;
+
+	if (!info)
+		return;
+
+	now = READ_ONCE(jiffies);
+	info->pid = p->pid;
+	info->tgid = p->tgid;
+	memcpy(info->comm, p->comm, TASK_COMM_LEN);
+	info->vruntime_end = p->se.vruntime;
+	info->walltime = jiffies_to_nsecs(now - (unsigned long) info->walltime);
+	info->sum_exec_runtime = p->se.sum_exec_runtime;
+#ifdef CONFIG_GVTS_DEBUG_NORMALIZATION
+	info->num_normalization = p->se.num_normalization;
+	info->added_normalization = p->se.added_normalization;
+	info->max_added_normalization = p->se.max_added_normalization;
+#endif
+	mb();
+	/* printk(KERN_ERR "task->remember->exited pid: %d comm: %s exited: %d\n",
+						info->pid, info->comm, atomic_read(&info->exited)); */
+	if (atomic_cmpxchg(&info->exited, 0, 1) == 0)
+		return;
+	
+	type = atomic_read(&info->exited);
+	if (type != 5) {
+		printk(KERN_ERR "task->remember->exited is corrupted. pid: %d comm: %s exited: %d\n",
+						info->pid, info->comm, type);
+		return;
+	}
+
+	/* exited == 5, need to free here */
+	kfree(info);
+	return;
+}
+
+static int remember_num_info(void) {
+	int ret = 0;
+	struct remember_info *head, *curr;
+
+	head = atomic_ptr_read(&remember_head);
+	if (!head)
+		return -ENOENT;
+	curr = atomic_ptr_cmpxchg(&remember_now_taken, NULL, head);
+	if (curr)
+		return -EBUSY;
+	
+	for (curr = head; curr; curr = curr->next) {
+		if (atomic_cmpxchg(&curr->exited, 1, 2) == 1)
+			ret++;
+	}
+
+	return ret;
+}
+
+
+static int get_remembered_info(int num_entry, struct remember_info *user) {
+	struct remember_info **array, *prev, *curr, *head;
+	int idx, i, num = 0;
+	int ret = 0, exited;
+	if (num_entry <= 0)
+		return -ENOENT;
+
+	head = atomic_ptr_read(&remember_now_taken);
+	if (!head)
+		return -ENOENT;
+
+	array = kzalloc(sizeof(struct remember_info *) * num_entry, GFP_KERNEL);
+	if (!array)
+		return -ENOMEM;
+
+	prev = NULL;
+	curr = head;
+	while (curr) {
+		exited = atomic_cmpxchg(&curr->exited, 2, 3);
+		//printk(KERN_ERR "%s: num: %d exited: %d\n", __func__, num, exited);
+		if (exited != 2) {
+			prev = curr;
+			curr = curr->next;
+		}
+		
+		if (num >= num_entry) {
+			ret = -EFBIG;
+			goto unlock;
+		}
+
+		array[num++] = curr;
+		if (prev) {
+			/* don't change the prev */
+			atomic_inc(&curr->exited); /* exited = 4: safe to delete */
+			prev->next = curr->next;
+			curr = curr->next;
+		} else {
+			prev = curr;
+			curr = curr->next;
+		}
+	}
+
+	atomic_ptr_set(&remember_now_taken, NULL);
+unlock:
+
+	if (ret < 0)
+		goto free;
+
+	for (idx = 0; idx < num; idx++) {
+		array[idx]->next = (struct remember_info *) (pointer_size_t) idx;
+		if (!array[idx]->parent) {
+			array[idx]->parent = (struct remember_info *) (pointer_size_t) -1;
+			goto copy;
+		}
+
+		for (i = 0; i < num; i++) {
+			if (array[idx]->parent == array[i])
+				break;
+		}
+		/* if parent have not ended yet, parent = #entries. */
+		array[idx]->parent = (struct remember_info *) (pointer_size_t) i;
+
+copy:
+		if (copy_to_user(user, array[idx], sizeof(struct remember_info))) {
+			ret = -EFAULT;
+			goto free;
+		}
+
+		user++; /* next element */
+	}
+
+	/* normal return */
+	ret = num;
+
+free:
+	for (idx = 0; idx < num; idx++) {
+		if (atomic_read(&array[idx]->exited) == 4)
+			kfree(array[idx]);
+	}
+	kfree(array);
+
+	return ret;
+}
+#endif /* CONFIG_GVTS */
+
 #if defined(CONFIG_SCHED_DEBUG) && defined(CONFIG_JUMP_LABEL)
 /*
  * Debugging: various feature bits
@@ -744,10 +1025,19 @@ int tg_nop(struct task_group *tg, void *data)
 }
 #endif
 
+#ifdef CONFIG_GVTS
+void update_tg_load_sum(struct sched_entity *se, struct task_group *tg, 
+						unsigned long old, unsigned long new, 
+						int no_update_if_zero); 
+#endif
+
 static void set_load_weight(struct task_struct *p, bool update_load)
 {
 	int prio = p->static_prio - MAX_RT_PRIO;
 	struct load_weight *load = &p->se.load;
+#ifdef CONFIG_GVTS
+	unsigned long old_weight = load->weight;
+#endif
 
 	/*
 	 * SCHED_IDLE tasks get minimal weight:
@@ -770,6 +1060,16 @@ static void set_load_weight(struct task_struct *p, bool update_load)
 		load->inv_weight = sched_prio_to_wmult[prio];
 		p->se.runnable_weight = load->weight;
 	}
+#ifdef CONFIG_GVTS
+	if (p->sched_class == &fair_sched_class) {
+		p->se.eff_load.weight = 0;
+		p->se.eff_load.inv_weight = 0;
+		p->se.eff_weight_real = 0;
+		p->se.lagged_weight = 0;
+		update_tg_load_sum(&p->se, p->sched_task_group, 
+				old_weight, load->weight, TG_LOAD_SUM_CHANGE);
+	}
+#endif
 }
 
 #ifdef CONFIG_UCLAMP_TASK
@@ -2768,6 +3068,13 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->on_rq			= 0;
 
 	p->se.on_rq			= 0;
+#ifdef CONFIG_GVTS
+	p->se.eff_load.weight = 0; /* Not yet set. This is context dependent value. */
+	p->se.eff_load.inv_weight = 0;
+	p->se.curr_child = NULL; /* always NULL for leaf sched_entity */
+	p->se.eff_weight_real = 0;
+	p->se.lagged_weight = 0;
+#endif /* CONFIG_GVTS */
 	p->se.exec_start		= 0;
 	p->se.sum_exec_runtime		= 0;
 	p->se.prev_sum_exec_runtime	= 0;
@@ -2777,11 +3084,24 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	p->se.cfs_rq			= NULL;
+#ifdef CONFIG_GVTS_BANDWIDTH
+	p->se.state_q = NULL;
+	INIT_LIST_HEAD(&p->se.state_node);
+#endif /* CONFIG_GVTS_BANDWIDTH */
 #endif
 
 #ifdef CONFIG_SCHEDSTATS
 	/* Even if schedstat is disabled, there should not be garbage */
 	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
+#endif
+
+#ifdef CONFIG_GVTS
+	p->se.tg_load_sum_contrib = 0;
+#endif
+#ifdef CONFIG_GVTS_DEBUG_NORMALIZATION
+	p->se.num_normalization = 0;
+	p->se.added_normalization = 0;
+	p->se.max_added_normalization = 0;
 #endif
 
 	RB_CLEAR_NODE(&p->dl.rb_node);
@@ -2986,6 +3306,9 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	if (p->sched_class->task_fork)
 		p->sched_class->task_fork(p);
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+#ifdef CONFIG_GVTS
+	remember_task_fork(p, current);
+#endif
 
 #ifdef CONFIG_SCHED_INFO
 	if (likely(sched_info_on()))
@@ -4045,6 +4368,11 @@ restart:
 	BUG();
 }
 
+#ifdef CONFIG_GVTS
+void transit_busy_to_idle(struct rq *rq);
+void transit_idle_to_busy(struct rq *rq);
+#endif
+
 /*
  * __schedule() is the main scheduler function.
  *
@@ -4160,6 +4488,10 @@ static void __sched notrace __schedule(bool preempt)
 		 *   is a RELEASE barrier),
 		 */
 		++*switch_count;
+#ifdef CONFIG_GVTS
+		if (unlikely(next == rq->idle && rq->cfs.was_idle == CFS_RQ_WAS_BUSY))
+			transit_busy_to_idle(rq);
+#endif
 
 		trace_sched_switch(preempt, prev, next);
 
@@ -6007,6 +6339,195 @@ SYSCALL_DEFINE2(sched_rr_get_interval_time32, pid_t, pid,
 }
 #endif
 
+#ifdef CONFIG_GVTS
+static int do_remember_task(pid_t pid) {
+	struct task_struct *p; 
+	long retval;
+	
+	if (pid < 0)
+		return -EINVAL;
+
+	retval = -ESRCH;
+
+	rcu_read_lock();
+	if (pid == 0)
+		p = current;
+	else {
+		p = find_process_by_pid(pid);
+		if (!p)
+			goto out_unlock;
+	}
+
+	get_task_struct(p);
+	retval = __remember_task_new(p, NULL);
+	put_task_struct(p);
+
+out_unlock:
+	rcu_read_unlock();
+	
+	return retval;
+}
+
+/* rcu_read_lock should be held in caller */
+static void __do_get_task_runtime(struct task_struct *p, struct task_runtime_info *info)
+{
+	struct task_struct *t = p;
+	struct task_struct *pos;
+	int init_tid = 0;
+
+	do {
+		get_task_struct(t);
+		/* to prevent infinite loop bug */
+		if (unlikely(init_tid == 0))
+			init_tid = t->pid;
+		else if (unlikely(init_tid == t->pid)) {
+			put_task_struct(t);
+			return;
+		}
+
+		info->sum_exec_runtime += t->se.sum_exec_runtime;	
+
+		if (!list_empty(&t->children)) {
+			int init_child_tid = 0;
+			/* traverse children */
+			list_for_each_entry_rcu(pos, &t->children, sibling) {
+				get_task_struct(pos);
+				/* to prevent infinite loop bug */
+				if (unlikely(init_child_tid == 0))
+					init_child_tid = pos->pid;
+				else if (unlikely(init_child_tid == pos->pid)) {
+					put_task_struct(pos);
+					put_task_struct(t);
+					return;
+				}
+				__do_get_task_runtime(pos, info);
+				put_task_struct(pos);
+			}
+		}
+		put_task_struct(t);
+	} while_each_thread(p, t);
+}
+
+static long do_get_task_runtime(pid_t pid, void __user * __info)
+{
+	struct task_runtime_info info;
+	struct task_struct *p; 
+	long retval;
+	
+	if (pid < 0)
+		return -EINVAL;
+
+	memset(&info, 0, sizeof(struct task_runtime_info));
+
+	retval = -ESRCH;
+
+	preempt_disable();
+	local_irq_disable();
+
+	rcu_read_lock();
+	if (pid == 0)
+		p = current;
+	else {
+		p = find_process_by_pid(pid);
+		if (!p)
+			goto out_unlock;
+	}
+
+	__do_get_task_runtime(p, &info); 
+	retval = 0;
+
+out_unlock:
+	rcu_read_unlock();
+	
+	local_irq_enable();
+	preempt_enable();
+
+	if (retval)
+		return retval;
+
+	if (copy_to_user(__info, &info, sizeof(struct task_runtime_info)))
+		return -EFAULT;
+
+	return 0;
+}
+#endif /* CONFIG_GVTS */
+
+/* Definition of operations of gvts system call */
+#define SET_FAST_CORE               0 /* obsolute */
+#define SET_SLOW_CORE               1 /* obsolute */
+#define SET_UNIT_VRUNTIME	        2 /* obsolute */
+#define GET_THREADS_INFO            3 /* obsolute */
+#define START_MEASURING_IPS_TYPE    4 /* obsolute */
+#define STOP_MEASURING_IPS_TYPE     5 /* obsolute */
+#define CORE_PINNING                6 /* obsolute */
+#define GET_TASK_RUNTIME			7
+#define REMEMBER_TASK				13
+#define GET_REMEMBERED_INFO			14
+/**
+ * sys_gvts - set/change the gvts related things, especially for gvts_amp
+ * @op: the operation id
+ * @id: cpu id or pid, mostly
+ * @num: a number, e.g., unit_vruntime
+ * @vars: a user space pointer for large parameter
+ */
+SYSCALL_DEFINE4(gvts, int, op, int, id, u64, num, void __user *, vars)
+{
+	switch(op) {
+#ifdef CONFIG_GVTS
+		/* for compatibility */
+	case SET_FAST_CORE:
+	case SET_SLOW_CORE:
+	case SET_UNIT_VRUNTIME:
+	case GET_THREADS_INFO:
+	case START_MEASURING_IPS_TYPE:
+	case STOP_MEASURING_IPS_TYPE:
+	case CORE_PINNING:
+			/* obsolete operations */
+			return -EINVAL;
+
+	case GET_TASK_RUNTIME:
+			/* return the info of the task whose pid is @id.
+			 * if id == 0, return the info of the current task.
+			 * The info include vruntime, sum_exec_runtime, sum_perf_runtime, and sum_type_runtime[].
+			 * See the struct task_runtime_info 
+			 */
+			if (num || !vars)
+				return -EINVAL;
+			return do_get_task_runtime(id, vars);
+
+	case REMEMBER_TASK:
+			if (num || vars)
+				return -EINVAL;
+			return do_remember_task(id);
+
+	case GET_REMEMBERED_INFO:
+			/* id == 0: flush the remembered info
+			 * id == 1: return the number of entires remembered
+			 * id == 2: copy the information to @vars
+			 */
+			if (id == 0) {
+				if (num || vars)
+					return -EINVAL;
+				return remember_task_flush();
+			} else if (id == 1) {
+				if (num || vars)
+					return -EINVAL;
+				return remember_num_info();
+			} else if (id == 2) {
+				if (!num || !vars)
+					return -EINVAL;
+				return get_remembered_info(num, vars);
+			} else
+				return -EINVAL;
+
+#endif /* CONFIG_GVTS */	
+	default: /* invalid operation */
+		return -EINVAL;
+	}
+}
+
+static const char stat_nam[] = TASK_STATE_TO_CHAR_STR;
+
 void sched_show_task(struct task_struct *p)
 {
 	unsigned long free = 0;
@@ -6754,6 +7275,10 @@ void __init sched_init(void)
 #ifdef CONFIG_SMP
 		rq->sd = NULL;
 		rq->rd = NULL;
+#ifdef CONFIG_GVTS
+		rq->sd_vruntime = NULL;
+		rq->infeasible_weight = 0;
+#endif
 		rq->cpu_capacity = rq->cpu_capacity_orig = SCHED_CAPACITY_SCALE;
 		rq->balance_callback = NULL;
 		rq->active_balance = 0;

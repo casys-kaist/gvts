@@ -408,6 +408,10 @@ static void print_cfs_group_stats(struct seq_file *m, int cpu, struct task_group
 	P(se->avg.util_avg);
 	P(se->avg.runnable_load_avg);
 #endif
+#ifdef CONFIG_GVTS
+	P(se->eff_load.weight);
+	P(se->eff_weight_real);
+#endif
 
 #undef PN_SCHEDSTAT
 #undef PN
@@ -444,6 +448,14 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
 		(long long)(p->nvcsw + p->nivcsw),
 		p->prio);
 
+#ifdef CONFIG_GVTS
+	SEQ_printf(m, " %6ld %10ld %8ld",
+		p->se.load.weight, p->se.eff_weight_real, p->se.avg.util_avg
+		);
+	SEQ_printf(m, " %10ld %9Ld.%06ld",
+		p->se.lagged_weight, SPLIT_NS(p->se.lagged / NICE_0_LOAD));
+#endif /* CONFIG_GVTS */
+
 	SEQ_printf(m, "%9Ld.%06ld %9Ld.%06ld %9Ld.%06ld",
 		SPLIT_NS(schedstat_val_or_zero(p->se.statistics.wait_sum)),
 		SPLIT_NS(p->se.sum_exec_runtime),
@@ -466,8 +478,16 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 	SEQ_printf(m, "\n");
 	SEQ_printf(m, "runnable tasks:\n");
 	SEQ_printf(m, " S           task   PID         tree-key  switches  prio"
+#ifdef CONFIG_GVTS
+	" weight eff_weight load_avg"
+	" lag_weight lagged          "
+#endif
 		   "     wait-time             sum-exec        sum-sleep\n");
 	SEQ_printf(m, "-------------------------------------------------------"
+#ifdef CONFIG_GVTS
+	"---------------------------"
+	"-----------------"
+#endif
 		   "----------------------------------------------------\n");
 
 	rcu_read_lock();
@@ -487,6 +507,12 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 	struct rq *rq = cpu_rq(cpu);
 	struct sched_entity *last;
 	unsigned long flags;
+#ifdef CONFIG_GVTS
+	u64 real_min_vruntime = -1;
+	u64 target_vruntime = -1, vruntime_interval = -1, vruntime_tolerance = -1;
+	struct sd_vruntime *sdv;
+	int sdv_level = 0;
+#endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	SEQ_printf(m, "\n");
@@ -513,6 +539,26 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 			SPLIT_NS(min_vruntime));
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "max_vruntime",
 			SPLIT_NS(max_vruntime));
+#ifdef CONFIG_GVTS
+	real_min_vruntime = cfs_rq->real_min_vruntime;
+	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "real_min_vruntime",
+			SPLIT_NS(real_min_vruntime));
+#endif
+#ifdef CONFIG_GVTS
+	target_vruntime = cfs_rq->target_vruntime;
+	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "target_vruntime",
+			SPLIT_NS(target_vruntime));
+	sdv = rq->sd_vruntime;
+	for (; sdv; sdv = sdv->parent, sdv_level++) {
+		target_vruntime = atomic64_read(&sdv->target);
+		vruntime_interval = sdv->interval;
+		vruntime_tolerance = sdv->tolerance;
+		SEQ_printf(m, "  .target_vruntime[%1d]            : %6Ld.%06ld interval[%d]: %6Ld.%06ld tolerance[%d]: %6Ld.%06ld\n", 
+					sdv_level, SPLIT_NS(target_vruntime),
+					sdv_level, SPLIT_NS(vruntime_interval), 
+					sdv_level, SPLIT_NS(vruntime_tolerance));
+	}
+#endif
 	spread = max_vruntime - MIN_vruntime;
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "spread",
 			SPLIT_NS(spread));
@@ -545,6 +591,20 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 	SEQ_printf(m, "  .%-30s: %ld\n", "tg_load_avg",
 			atomic_long_read(&cfs_rq->tg->load_avg));
 #endif
+#ifdef CONFIG_GVTS
+	SEQ_printf(m, "  .%-30s: %ld\n", "tg_load_sum",
+			atomic_long_read(&cfs_rq->tg->load_sum));
+#ifdef CONFIG_FAIR_GROUP_SCHED	
+	if (cfs_rq == &cfs_rq->rq->cfs) {
+#endif
+		SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "lagged",
+				SPLIT_NS(cfs_rq->lagged / NICE_0_LOAD));
+		SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "lagged_avg",
+				cfs_rq->h_nr_running > 0 ? SPLIT_NS(cfs_rq->lagged / NICE_0_LOAD / cfs_rq->h_nr_running) : SPLIT_NS(0));
+#ifdef CONFIG_FAIR_GROUP_SCHED	
+	}	
+#endif
+#endif /* CONFIG_GVTS */
 #endif
 #ifdef CONFIG_CFS_BANDWIDTH
 	SEQ_printf(m, "  .%-30s: %d\n", "throttled",
@@ -952,6 +1012,10 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 	P(se.avg.util_est.ewma);
 	P(se.avg.util_est.enqueued);
 #endif
+#ifdef CONFIG_GVTS
+	P(se.tg_load_sum_contrib);
+	P(se.eff_load.weight);
+#endif
 	P(policy);
 	P(prio);
 	if (task_has_dl_policy(p)) {
@@ -984,3 +1048,166 @@ void proc_sched_set_task(struct task_struct *p)
 	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
 #endif
 }
+
+#ifdef CONFIG_GVTS
+#define pr_emerg(fmt, ...) \
+	printk(KERN_EMERG pr_fmt(fmt), ##__VA_ARGS__)
+
+static void dump_task(struct task_struct *p) {
+	pr_emerg("%-5d %20s %5lx %2d-%-2d %16lld %6ld %10ld %8ld %10ld %16lld %16lld %16lld"
+#ifdef CONFIG_SCHEDSTATS
+			" %16lld %16lld"
+#endif
+			" %3d"
+#ifdef CONFIG_CGROUP_SCHED
+			" %-6s"
+#endif
+			"\n"
+				,task_pid_nr(p)
+				,p->comm
+				,p->state
+				,p->on_rq
+				,p->se.on_rq
+				,p->se.vruntime
+				,p->se.load.weight
+				,p->se.eff_load.weight
+				,p->se.avg.util_avg
+				,p->se.lagged_weight
+				,p->se.lagged
+				,p->se.lagged_target
+				,p->se.sum_exec_runtime
+#ifdef CONFIG_SCHEDSTATS
+				,p->se.statistics.wait_sum
+				,p->se.statistics.sum_sleep_runtime
+#endif
+				,task_cpu(p)
+#ifdef CONFIG_CGROUP_SCHED
+				,task_group_path(task_group(p))
+#endif
+				);
+}
+
+static void dump_rq(struct rq *rq) {
+	pr_emerg("%-3d %6d %6ld %8d %20s %16lld %16lld %16lld %16lld %16lld %16lld %16lld %10ld\n",
+				cpu_of(rq),
+				rq->nr_running,
+				rq->load.weight,
+				rq->curr ? task_pid_nr(rq->curr) : -1,
+				rq->curr ? rq->curr->comm : "NULL",
+				rq->clock,
+				rq->clock_task,
+				rq->cfs.min_vruntime,
+				rq->cfs.real_min_vruntime,
+				rq->cfs.target_vruntime,
+				rq->cfs.target_interval,
+				rq->cfs.lagged,
+				rq->cfs.lagged_weight
+				);
+}
+
+void dump_sched(void) {
+	struct task_struct *p, *g;
+	int cpu, level;
+	struct rq *rq;
+	struct sched_domain *sd;
+	struct sd_vruntime *sdv;
+
+	/* header for dump_rq() */
+	pr_emerg("DUMP_RQ\n");
+	pr_emerg("%-3s %6s %6s %8s %20s %16s %16s %16s %16s %16s %16s %16s %10s\n",
+				"cpu",
+				"nr_run",
+				"weight",
+				"curr_pid",
+				"curr_comm",
+				"clock",
+				"clock_task",
+				"min_vruntime",
+				"real_min_vrt",
+				"target",
+				"interval",
+				"lagged",
+				"lag_weight"
+				);
+	for_each_possible_cpu(cpu) {
+		rq = cpu_rq(cpu);
+		dump_rq(rq);
+	}
+	pr_emerg("\n");
+
+	pr_emerg("DUMP_SDVRUNTIME\n");
+	rcu_read_lock();
+	pr_emerg("%-3s %3s %16s %16s %16s %10s %16s %7s %7s\n",
+				"cpu",
+				"lvl",
+				"target",
+				"interval",
+				"tolerance",
+				"updated_by",
+				"largest_idle_vrt",
+				"nr_busy",
+				"nr_span"
+				);
+	for_each_possible_cpu(cpu) {
+		level = 0;
+		for_each_domain(cpu, sd) {
+			sdv = sd->vruntime;
+
+			pr_emerg("%-3d %3d %16ld %16lld %16lld %10d %16ld %7d %7d\n",
+						cpu,
+						level,
+						atomic64_read(&sdv->target),
+						sdv->interval,
+						sdv->tolerance,
+						atomic_read(&sdv->updated_by),
+						atomic64_read(&sdv->largest_idle_min_vruntime),
+						atomic_read(&sdv->nr_busy),
+						cpumask_weight(to_cpumask(sdv->span))
+						);
+
+			level++;
+		}
+	}
+	pr_emerg("\n");
+
+	/* header for dump_task() */
+	pr_emerg("DUMP_TASK\n");
+	pr_emerg("%-5s %20s %5s %5s %16s %6s %10s %8s %10s %16s %16s %16s"
+#ifdef CONFIG_SCHEDSTATS
+			 " %16s %16s"
+#endif
+			 " %3s"
+#ifdef CONFIG_CGROUP_SCHED
+			 " %-6s"
+#endif
+			 "\n"
+				,"pid"
+				,"comm"
+				,"state"
+				,"on_rq"
+				,"vruntime"
+				,"weight"
+				,"eff_weight"
+				,"util_avg"
+				,"lag_weight"
+				,"lagged"
+				,"lagged_target"
+				,"sum_exec"
+#ifdef CONFIG_SCHEDSTATS
+				,"wait_time"
+				,"sum_sleep"
+#endif
+				,"cpu"
+#ifdef CONFIG_CGROUP_SCHED
+				,"cgroup"
+#endif
+				);
+
+	for_each_process_thread(g, p) {
+		dump_task(p);
+	}
+	rcu_read_unlock();
+
+}
+EXPORT_SYMBOL(dump_sched);
+#endif

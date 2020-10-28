@@ -564,6 +564,150 @@ config BUILD_BIN2C
 	bool
 	default n
 
+config GVTS
+	bool "Global Virtual-time Fair Scheduler by CDKIM"
+	default y
+	help
+		* Global Virtual-time Balancing: virtual-time based fair scheduling for multi-cores
+		When all threads in a CPU's runqueue reaches a target virtual time,
+		the CPU firstly scans threads in other CPUs which have not reached the target.
+		If such thread exists, the CPU pulls the thread.
+		Otherwise, the CPU increases the target and goes on.
+		
+		* Topology-aware hierarchical balancing for scalability
+		The 'interval' length, the amount of target increase for each interval, 
+		determines the accuracy of fairness and the frequency of thread migreation.
+		GVTS awares the topology and uses the long interval length for NUMA,
+		and the short interval length for SMT.
+		This mitigates the thread migration overhead and improves fairness accuracy.
+
+		* Effective weight	
+		For group-aware scheduling, for every tick, enqueue or dequeue,
+		effective weight is calculated and used for updating vruntime at update_curr().
+		eff_weight = tg->shares * se->load.weight / calc_tg_weight(tg)
+		For multi-level group, instead of tg->shares, use effective_weight of the group.
+		eff_weight_group = parent_tg->shares * tg->shares / calc_tg_weight(parent_tg).
+
+		* Use real-time sum of load
+		Note that calc_tg_weight(tg) uses tg->load_sum instead of tg->load_avg.
+		tg->load_sum is the absolute and real-time value.
+		
+		* Consider the remaining time to reach the next target
+		When doing target vruntime balancing, consider the remaining time to reach the next target.
+		Actually, global virtual time balancing tries to all cpus reach
+		the next target as simultaneously as possible.
+		- When calculating lagged, consider se->avg.util_avg value.
+		  eff_weight_real = eff_load.weight(w/o normalization) * util_avg 
+		                         >> (SCHED_LOAD_SHIFT - CONFIG_GVTS_LAGGED_WEIGHT_ADDED_BITS)
+		  and use eff_weight_real instead of eff_load.weight to calculat lagged.
+
+		* New vruntime normalization for slept or throttled tasks
+		- Let global_min_target is the minimum level-0 target for all CPUs
+		- For interactive jobs (CPU util < 6.25%)
+		  vruntime = global_min_target - (interval / 2)
+		- For batch jobs (CPU_util > 96.875%)a
+		  vruntime = vruntime (no change)
+		- Otherwise,
+		  vruntime += (global_min_target - target_at_sleep) * CPU_util
+
+		Other optimizations
+		- While active load balancing, considering rb_leftmost tasks first may be benefitial,
+		  since it is likely to have large lagged value.
+		- Ignore the local group CPUs while target virtual time balancing
+		  since the local group CPUs was balanced at the lower level domain.
+
+
+config GVTS_BANDWIDTH
+	bool "Support for bandwidth control in GVTS (EXPERIMENTAL)"
+	default y
+	depends on GVTS && CFS_BANDWIDTH
+	help
+		Support for bandwidth control (CFS_BANDWIDTH) in GVTS
+		Currently, this does not work properly for some cases.
+
+config GVTS_DEBUG_NORMALIZATION
+	bool "Debug normalization of vruntime"
+	default n
+	depends on GVTS
+	help
+		Debug information for virtual time normalization when a task is waking up
+
+config GVTS_STATS
+	bool "Schedstats for GVTS"
+	default y
+	depends on GVTS && SCHEDSTATS
+	help
+		Various statistics for debugging GVTS
+
+config GVTS_INTERVAL_SMT_SHARED
+	int "Target interval for cores sharing pipelines (ms)"
+	range 1 3000
+	depends on GVTS
+	default 30
+
+config GVTS_INTERVAL_LLC_SHARED
+	int "Target interval for cores sharing a LLC (ms)"
+	range 1 3000
+	depends on GVTS
+	default 90
+
+config GVTS_INTERVAL_NUMA
+	int "Target interval for cores in different nodes (ms)"
+	range 1 3000
+	depends on GVTS
+	default 150
+	help
+	  1000 indicates 1s target interval for local nodes,
+	  and 2s target interval for remote nodes.
+	  interval = value / 10 * numa_distance
+
+config GVTS_TOLERANCE_PERCENT
+	int "Tolerance value as a percentage of target interval."
+	range 0 100
+	depends on GVTS
+	default 30
+
+config GVTS_TARGET_DIFF_THRESHOLD
+	int "Target difference threshold for source activated balancing"
+	range 2 100
+	default 3
+	depends on GVTS
+	help
+		When difference between cfs_rq->target_vruntime and rq->sd_vruntime->target
+		is larger than CONFIG_GVTS_TARGET_DIFF_THRESHOLD * sd_vruntime->interval,
+		the source cpu activated the target vruntime balancing.
+
+
+config GVTS_TARGET_DIFF_INFEASIBLE_WEIGHT
+	int "Target difference threshold for detecting infeasible weight"
+	range 2 100
+	default 10
+	depends on GVTS
+	help
+		Target difference threshold for detecting infeasible weight
+		
+		GVTS detects infeasible weight if
+		  1. target diff >= GVTS_TARGET_DIFF_INFEASIBLE_WEIGHT
+		  2. nr_running = 1
+		  3. lagged_weight > others' lagged_weight
+		  Then, delete_min_target and do not update min_target for the task
+
+		The infeasibility of a CPU will be cleared 
+			1. when the CPU becomes idle.
+			2. when target diff < GVTS_TARGET_DIFF_INFEASIBLE_WEIGHT
+
+config GVTS_LAGGED_WEIGHT_ADDED_BITS
+	int 'The number of added bits to improve the accuracy of lagged_weight'
+	range 0 10
+	depends on GVTS
+	default 4
+	help
+		If this value is 0, the accuracy of lagged_weight is 10.
+		For smp,
+		  eff_weight_real = eff_weight_real * util_avg >> (SCHED_LOAD_SHIFT - ADDED_BITS)
+		For amp,
+		  eff_weight_real = eff_weight_real * util_avg << (ADDED_BITS) / efficiency[type]
+
 config IKCONFIG
 	tristate "Kernel .config support"
 	---help---

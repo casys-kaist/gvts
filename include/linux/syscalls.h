@@ -1421,4 +1421,8 @@ long compat_ksys_semtimedop(int semid, struct sembuf __user *tsems,
 			    unsigned int nsops,
 			    const struct old_timespec32 __user *timeout);
 
+#ifdef CONFIG_GVTS_SYSCALL
+asmlinkage long sys_gvts(int op, int id, u64 num, void __user *vars);
+#endif
+
 #endif
