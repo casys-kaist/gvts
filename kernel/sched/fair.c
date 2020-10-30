@@ -7307,6 +7307,253 @@ fail:
 	return -1;
 }
 
+#ifdef CONFIG_GVTS
+/* return the target vruntime value
+   even if the sched_domain is not linked with sd_vruntime. */
+static inline
+u64 get_sd_target(struct sched_domain *sd) {
+	if (sd->vruntime)
+		return atomic64_read(&sd->vruntime->target);
+	else {
+		/* if sd does not have vruntime, use its nearest parent's vruntime. */
+		sd = sd->parent;
+		while (unlikely(sd && !sd->vruntime))
+			sd = sd->parent;
+		if (likely(sd))
+			return atomic64_read(&sd->vruntime->target);
+		else
+			return 0;
+	}
+}
+/* TODO: this implementation assumes that A and B have same span_weight. plz fix this. */
+/* if group A is more idle than group B, return 1. Otherwise, return 0 */
+static inline int who_is_idle_group(s64 lagged_a, int idle_a, s64 lagged_b, int idle_b) {
+	if (idle_a > idle_b)
+		return 1;
+	else if (idle_a < idle_b)
+		return 0;
+	else if (lagged_a > lagged_b)
+		return 0;
+	else
+		return 1;
+}
+
+static struct sched_group *
+find_fastest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu) {
+	struct sched_group *fastest = NULL, *group = sd->groups;
+	/* if local group has no allowed cpu, this_lagged should not be selected. */
+	s64 min_lagged = LLONG_MAX, this_lagged = LLONG_MAX;
+	int min_idle = -1, this_idle = -1;
+	u64 target = get_sd_target(sd); 
+
+	do {
+		s64 lagged;
+		s64 lagged_sum;
+		int local_group;
+		int i;
+		int num_idle;
+
+		/* Skip over this group if it has no CPUs allowed */
+		if (!cpumask_intersects(sched_group_cpus(group),
+					tsk_cpus_allowed(p)))
+			continue;
+
+		local_group = cpumask_test_cpu(this_cpu,
+							sched_group_cpus(group));
+
+		lagged_sum = 0;
+		num_idle = 0;
+
+		for_each_cpu(i, sched_group_cpus(group)) {
+			if (idle_cpu(i)) {
+				num_idle++;
+			} else {
+				lagged = cpu_lagged(i, target) / group->group_weight;
+				lagged_sum += lagged;
+			}
+		}
+
+
+		if (local_group) {
+			this_lagged = lagged_sum;
+			this_idle = num_idle;
+		} else if (who_is_idle_group(lagged_sum, num_idle, min_lagged, min_idle)) {
+			min_lagged = lagged_sum;
+			min_idle = num_idle;
+			fastest = group;
+		}
+	} while (group = group->next, group != sd->groups);
+
+	if (!fastest || who_is_idle_group(this_lagged, this_idle, min_lagged, min_idle))
+		return NULL;
+	return fastest;
+}
+
+static int find_fastest_cpu(struct sched_domain *sd, struct sched_group *group, 
+											struct task_struct *p, int this_cpu)
+{
+	s64 lagged, min_lagged = LLONG_MAX;
+	u64 target;
+	unsigned int min_exit_latency = UINT_MAX;
+	u64 latest_idle_timestamp = 0;
+	int fastest_cpu = this_cpu;
+	int shallowest_idle_cpu = -1;
+	int i;
+
+	target = get_sd_target(sd);
+
+	/* Traverse only the allowed CPUs */
+	for_each_cpu_and(i, sched_group_cpus(group), tsk_cpus_allowed(p)) 
+		if (idle_cpu(i)) {
+			struct rq *rq = cpu_rq(i);
+			struct cpuidle_state *idle = idle_get_state(rq);
+			if (idle && idle->exit_latency < min_exit_latency) {
+				/*
+				 * We give priority to a CPU whose idle state
+				 * has the smallest exit latency irrespective
+				 * of any idle timestamp.
+				 */
+				min_exit_latency = idle->exit_latency;
+				latest_idle_timestamp = rq->idle_stamp;
+				shallowest_idle_cpu = i;
+			} else if ((!idle || idle->exit_latency == min_exit_latency) &&
+					   rq->idle_stamp > latest_idle_timestamp) {
+				/*
+				 * If equal or no active idle state, then
+				 * the most recently idled CPU might have
+				 * a warmer cache.
+				 */
+				latest_idle_timestamp = rq->idle_stamp;
+				shallowest_idle_cpu = i;
+			}
+		} else if (shallowest_idle_cpu == -1) {
+			lagged = cpu_lagged(i, target);
+			/* TODO: the second condition may not useful unless considering tolerance. */
+			if (lagged < min_lagged || (lagged == min_lagged && i == this_cpu)) {
+				min_lagged = lagged;
+				fastest_cpu = i;
+			}
+		}
+
+	return shallowest_idle_cpu != -1 ? shallowest_idle_cpu : fastest_cpu;
+}
+
+/*
+ * select_task_rq_fair: Select target runqueue for the waking task in domains
+ * that have the 'sd_flag' flag set. In practice, this is SD_BALANCE_WAKE,
+ * SD_BALANCE_FORK, or SD_BALANCE_EXEC.
+ *
+ * Balances load by selecting the idlest cpu in the idlest group, or under
+ * certain conditions an idle sibling cpu if the domain has SD_WAKE_AFFINE set.
+ *
+ * Returns the target cpu number.
+ *
+ * preempt must be disabled.
+ */
+static int
+select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
+{
+	struct sched_domain *tmp, *sd = NULL;
+	int cpu = smp_processor_id();
+	int new_cpu = prev_cpu;
+	int want_affine = 0;
+	int sync = wake_flags & WF_SYNC;
+	
+	if (sd_flag & SD_BALANCE_WAKE)
+		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, tsk_cpus_allowed(p));
+
+	rcu_read_lock();
+	if (want_affine) {
+		if (prev_cpu != cpu && cpus_share_cache(cpu, prev_cpu) && idle_cpu(prev_cpu)) {
+			new_cpu = prev_cpu;
+			goto out;
+		}
+
+		if (sync && cpu_rq(cpu)->cfs.h_nr_running == 1) {
+			new_cpu = cpu;
+			goto out;
+		}
+
+		if (cpus_share_cache(prev_cpu, cpu)) {
+			sd = rcu_dereference(per_cpu(sd_llc, cpu));
+			new_cpu = cpu;
+		} else {
+			sd = rcu_dereference(per_cpu(sd_llc, prev_cpu));
+			cpu = prev_cpu;
+		}
+
+	}
+	
+	if (!sd) { /* Basically, start from the highest domain */
+		for_each_domain(cpu, tmp)
+			sd = tmp;
+		new_cpu = cpu;
+	}
+
+	while (sd) {
+		struct sched_group *group;
+		int weight;
+	
+		/* if (!(sd->flags & sd_flag)) {
+			sd = sd->child;
+			continue;
+		} */
+
+		group = find_fastest_group(sd, p, cpu);
+		if (!group) {
+			if (!sd->child && sd->span_weight > 1) { 
+				/* the lowest domain. pick up a rq */
+				/* Note that sd->groups is the local group */
+				new_cpu = find_fastest_cpu(sd, sd->groups, p, cpu);
+				break;
+			}
+			sd = sd->child;
+			continue;
+		}
+
+		new_cpu = find_fastest_cpu(sd, group, p, cpu);
+		if (new_cpu == cpu) {
+			/* Now try balancing at a lower domain level of cpu */
+			sd = sd->child;
+			continue;
+		}
+
+		cpu = new_cpu;
+		weight = sd->span_weight;
+		sd = NULL;
+		for_each_domain(cpu, tmp) {
+			if (weight <= tmp->span_weight)
+				break;
+			if (tmp->flags & sd_flag)
+				sd = tmp;
+		}
+		/* while loop will break here if sd == NULL */
+	}
+
+#ifdef CONFIG_GVTS_STATS
+	if (new_cpu == -1)
+		gvts_stat_inc(cpu_rq(cpu), select_fail);
+	else {
+		if (idle_cpu(new_cpu))
+			gvts_stat_inc(cpu_rq(cpu), select_idle);
+		else
+			gvts_stat_inc(cpu_rq(cpu), select_busy);
+	}
+#endif
+out:
+	rcu_read_unlock();
+	
+	if (new_cpu == -1)
+		new_cpu = smp_processor_id();
+
+	if (!cpumask_test_cpu(new_cpu, tsk_cpus_allowed(p)))
+		new_cpu = cpumask_any(tsk_cpus_allowed(p));
+
+
+	return new_cpu;
+}
+#else /* !CONFIG_GVTS */
+
 /*
  * select_task_rq_fair: Select target runqueue for the waking task in domains
  * that have the 'sd_flag' flag set. In practice, this is SD_BALANCE_WAKE,
@@ -7381,6 +7628,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 
 	return new_cpu;
 }
+#endif /* !CONFIG_GVTS */
 
 static void detach_entity_cfs_rq(struct sched_entity *se);
 
@@ -7634,6 +7882,11 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
 	struct task_struct *p;
 	int new_tasks;
 
+#ifdef CONFIG_GVTS
+	if (vruntime_passed(real_min_vruntime(cfs_rq), cfs_rq->target_vruntime))
+		goto idle;
+#endif
+
 again:
 	if (!sched_fair_runnable(rq))
 		goto idle;
@@ -7718,6 +7971,17 @@ simple:
 #endif
 	if (prev)
 		put_prev_task(rq, prev);
+	
+#ifdef CONFIG_GVTS
+	/* Here is good place to detect idle-to-busy transition.
+	 * Even with FAIR_GROUP_SCHED, this function returns above
+	 * only if (prev->sched_class == &fair_sched_class).
+	 * That is, next will not be the first fair-class task
+	 * after idle mode.
+	 */
+	if (cfs_rq->was_idle == CFS_RQ_WAS_IDLE)
+		transit_idle_to_busy(rq);
+#endif
 
 	do {
 		se = pick_next_entity(cfs_rq, NULL);
@@ -7748,7 +8012,11 @@ idle:
 	if (!rf)
 		return NULL;
 
+#ifdef CONFIG_GVTS
+	new_tasks = target_vruntime_balance(rq, !cfs_rq->nr_running ? CPU_NEWLY_IDLE : CPU_NOT_IDLE);
+#else /* !CONFIG_GVTS */
 	new_tasks = newidle_balance(rq, rf);
+#endif
 
 	/*
 	 * Because newidle_balance() releases (and re-acquires) rq->lock, it is
@@ -7991,6 +8259,13 @@ struct lb_env {
 
 	unsigned int		flags;
 
+#ifdef CONFIG_GVTS
+	u64 target;
+	u64 interval;
+	u64 tolerance;
+	s64 lagged_diff;
+#endif
+
 	unsigned int		loop;
 	unsigned int		loop_break;
 	unsigned int		loop_max;
@@ -8000,6 +8275,7 @@ struct lb_env {
 	struct list_head	tasks;
 };
 
+#ifndef CONFIG_GVTS
 /*
  * Is this task likely cache-hot:
  */
@@ -8173,6 +8449,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	schedstat_inc(p->se.statistics.nr_failed_migrations_hot);
 	return 0;
 }
+#endif /* !CONFIG_GVTS */
 
 /*
  * detach_task() -- detach the task for the migration specified in env
@@ -8185,6 +8462,7 @@ static void detach_task(struct task_struct *p, struct lb_env *env)
 	set_task_cpu(p, env->dst_cpu);
 }
 
+#ifndef CONFIG_GVTS
 /*
  * detach_one_task() -- tries to dequeue exactly one task from env->src_rq, as
  * part of active balancing operations within "domain".
@@ -8215,9 +8493,11 @@ static struct task_struct *detach_one_task(struct lb_env *env)
 	}
 	return NULL;
 }
+#endif /* !CONFIG_GVTS */
 
 static const unsigned int sched_nr_migrate_break = 32;
 
+#ifndef CONFIG_GVTS
 /*
  * detach_tasks() -- tries to detach up to imbalance runnable load from
  * busiest_rq, as part of a balancing operation within domain "sd".
@@ -8314,6 +8594,7 @@ next:
 
 	return detached;
 }
+#endif /* !CONFIG_GVTS */
 
 /*
  * attach_task() -- attach the task detached by detach_task() to its new rq.
@@ -9182,6 +9463,7 @@ next_group:
 	}
 }
 
+#ifndef CONFIG_GVTS
 /**
  * check_asym_packing - Check to see if the group is packed into the
  *			sched domain.
@@ -9588,6 +9870,7 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 
 	return busiest;
 }
+#endif /* !CONFIG_GVTS */
 
 /*
  * Max backoff if we encounter pinned tasks. Pretty arbitrary value, but
@@ -9595,6 +9878,7 @@ static struct rq *find_busiest_queue(struct lb_env *env,
  */
 #define MAX_PINNED_INTERVAL	512
 
+#ifndef CONFIG_GVTS
 static inline bool
 asym_active_balance(struct lb_env *env)
 {
@@ -9961,6 +10245,7 @@ out_one_pinned:
 out:
 	return ld_moved;
 }
+#endif /* !CONFIG_GVTS */
 
 static inline unsigned long
 get_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
@@ -9990,6 +10275,7 @@ update_next_balance(struct sched_domain *sd, unsigned long *next_balance)
 		*next_balance = next;
 }
 
+#ifndef CONFIG_GVTS
 /*
  * active_load_balance_cpu_stop is run by the CPU stopper. It pushes
  * running tasks off the busiest CPU onto idle CPUs. It requires at
@@ -10080,8 +10366,11 @@ out_unlock:
 
 	return 0;
 }
+#endif /* !CONFIG_GVTS */
 
+#ifndef CONFIG_GVTS
 static DEFINE_SPINLOCK(balancing);
+#endif
 
 /*
  * Scale the max load_balance interval with the number of CPUs in the system.
@@ -10092,6 +10381,7 @@ void update_max_interval(void)
 	max_load_balance_interval = HZ*num_online_cpus()/10;
 }
 
+#ifndef CONFIG_GVTS
 /*
  * It checks each scheduling domain to see if it is due to be balanced,
  * and initiates a balancing operation if so.
@@ -10198,6 +10488,7 @@ out:
 #endif
 	}
 }
+#endif /* !CONFIG_GVTS */
 
 static inline int on_null_domain(struct rq *rq)
 {
@@ -10548,8 +10839,12 @@ static bool _nohz_idle_balance(struct rq *this_rq, unsigned int flags,
 			update_rq_clock(rq);
 			rq_unlock_irqrestore(rq, &rf);
 
+#ifdef CONFIG_GVTS
+			_target_vruntime_balance(rq, CPU_IDLE);
+#else /* !CONFIG_GVTS */
 			if (flags & NOHZ_BALANCE_KICK)
 				rebalance_domains(rq, CPU_IDLE);
+#endif
 		}
 
 		if (time_after(next_balance, rq->next_balance)) {
@@ -10659,6 +10954,7 @@ static inline bool nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle
 static inline void nohz_newidle_balance(struct rq *this_rq) { }
 #endif /* CONFIG_NO_HZ_COMMON */
 
+#ifndef CONFIG_GVTS
 /*
  * idle_balance is called by schedule() if this_cpu is about to become
  * idle. Attempts to pull tasks from other CPUs.
@@ -10776,6 +11072,1132 @@ out:
 
 	return pulled_task;
 }
+#endif /* !CONFIG_GVTS */
+
+#ifdef CONFIG_GVTS
+void set_min_vruntime_idle_to_busy(struct rq *rq)
+{
+	struct cfs_rq *cfs_rq = &rq->cfs;
+	cfs_rq->min_vruntime = get_min_target(rq);
+#ifndef CONFIG_64BIT
+	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+#endif
+	return;
+}
+	
+/* rq->lock is held */
+void transit_idle_to_busy(struct rq *rq) 
+{
+	int this_cpu = rq->cpu;
+	struct cfs_rq *cfs_rq = &rq->cfs;
+	struct sched_domain *sd;
+	struct sd_vruntime *sdv;
+
+	rcu_read_lock();
+
+	/* set min_vruntime before increment nr_busy */
+	set_min_vruntime_idle_to_busy(rq);
+
+	/* We increment nr_busy at higher to lower level.
+	 * For lockless read, it is better to stay busy more.
+	 * Seeing busy state, but actually idle is okay,
+	 * but the opposition is problematic.
+	 */
+	for_each_domain(this_cpu, sd)
+		if (!sd->parent)
+			break;
+
+	for_each_lower_domain(sd) {
+		sdv = sd->vruntime;
+		if (!sdv)
+			continue;
+		atomic_inc(&sdv->nr_busy);
+	}
+	rcu_read_unlock();
+
+	cfs_rq->was_idle = CFS_RQ_WAS_BUSY;
+}
+
+/* rq->lock is held */
+void transit_busy_to_idle(struct rq *rq) {
+	int this_cpu = rq->cpu;
+	struct cfs_rq *cfs_rq = &rq->cfs;
+	struct sched_domain *sd;
+	struct sd_vruntime *sdv;
+	int check_idle_min_vruntime = 5; /* max retry */
+	u64 min_vruntime = rq->cfs.min_vruntime;
+	u64 largest_vruntime; /* to atomically update largest_idle_min_vruntime */
+
+	if (unlikely(cfs_rq->was_idle != CFS_RQ_WAS_BUSY)) {
+		/* cfs_rq->was_idle can be
+		 * 1) CFS_RQ_UNINITIALIZED while booting up
+		 * 2) CFS_RQ_WAS_IDLE right after the initialization.
+		 *    (All domains are initialized as idle, but actually this was busy.
+		 */
+		return;
+	}
+
+	rcu_read_lock();
+	for_each_domain(this_cpu, sd) {
+		sdv = sd->vruntime;
+		if (!sdv)
+			continue;
+
+		/* check updated_by */
+		if (atomic_read(&sdv->updated_by) == this_cpu) {
+			atomic_cmpxchg(&sdv->updated_by, this_cpu, -1);
+		}
+
+		/* check largest_idle_min_vruntime to the domain having larger value. */
+		if (check_idle_min_vruntime) {
+			largest_vruntime = (u64) atomic64_read(&sdv->largest_idle_min_vruntime);
+
+			if (vruntime_passed_ne(min_vruntime, largest_vruntime)) {
+				largest_vruntime = atomic64_xchg(&sdv->largest_idle_min_vruntime, min_vruntime);
+
+				if (vruntime_passed_ne(largest_vruntime, min_vruntime)) {
+					/* actually, min_vruntime > largest_vruntime */
+					check_idle_min_vruntime = 0;
+					do {
+						min_vruntime = largest_vruntime;
+						largest_vruntime = atomic64_xchg(&sdv->largest_idle_min_vruntime, min_vruntime);
+						gvts_stat_inc(rq, largest_idle_min_vruntime_racing);
+					} while (vruntime_passed_ne(largest_vruntime, min_vruntime));
+				}
+			} else /* min_vruntime > largest_vruntime */
+				check_idle_min_vruntime = 0;
+		}
+
+		/* We decrement nr_busy at lower to higher level.
+		 * For lockless read, it is better to stay busy more.
+		 * Seeing busy state, but actually idle is okay,
+		 * but the opposition is problematic.
+		 */
+		atomic_dec(&sdv->nr_busy);
+	}
+	delete_min_target_rq(cfs_rq);
+	rcu_read_unlock();
+
+	if (unlikely(rq->infeasible_weight))
+		rq->infeasible_weight = 0;
+	
+	cfs_rq->was_idle = CFS_RQ_WAS_IDLE;
+	cfs_rq->idle_start = rq_clock(rq);
+}
+
+/* TODO: this implementation assumes that A and B have same span_weight. plz fix this. */
+/* if group A is busier than group B, return 1. Otherwise, return 0 */
+static inline int who_is_busy_group(s64 lagged_a, int busy_a, s64 lagged_b, int busy_b) {
+	if (busy_a > busy_b)
+		return 1;
+	else if (busy_a < busy_b)
+		return 0;
+	else if (lagged_a > lagged_b)
+		return 1;
+	else
+		return 0;
+}
+
+static struct sd_vruntime *
+find_most_lagged_child(struct lb_env *env) {
+	struct sd_vruntime *sdv = env->sd->vruntime;
+	struct sd_vruntime *busiest = NULL, *child = sdv->child;
+	s64 max_lagged = LLONG_MIN, this_lagged = LLONG_MIN;
+	int max_busy = -1, this_busy = 0;
+
+	if (child == NULL)
+		return sdv;
+
+	do {
+		s64 lagged;
+		s64 lagged_sum;
+		int local_group;
+		int i;
+		int num_busy;
+		unsigned int sum_nr_running;
+		struct rq *rq;
+
+		local_group = cpumask_test_cpu(env->dst_cpu,
+							sd_vruntime_span(child));
+
+		lagged_sum = 0;
+		num_busy = 0;
+		sum_nr_running = 0;
+
+		for_each_cpu(i, sd_vruntime_span(child)) {
+			if (idle_cpu(i))
+				continue;
+			/* to prevent overflow, divide the lagged value with group_weight.
+			   it's like an average value. */
+			rq = cpu_rq(i);
+			lagged = rq_lagged(rq, env->target) / child->nr_cpus;
+			lagged_sum += lagged;
+			num_busy++;
+			sum_nr_running += rq->cfs.h_nr_running;
+		}
+
+		if (local_group) {
+			this_lagged = lagged_sum;
+			this_busy = num_busy;
+			continue;
+		}
+		if (sum_nr_running < child->nr_cpus)
+			continue;
+
+#if CONFIG_GVTS_TOLERANCE_PERCENT > 0
+		/* Note that 1) tolerance = 0 for idle destination cpus
+		 *           2) tolerance is time (ns)
+		 *           3) lagged = remaining time (ns) to reach target * eff_weight * cpu_util
+		 *	            but, cpu util remains only CONFIG_GVTS_LAGGED_WEIGHT_ADDED_BITS.
+		 */
+		if (lagged_sum < env->tolerance * (1 << (SCHED_LOAD_SHIFT + CONFIG_GVTS_LAGGED_WEIGHT_ADDED_BITS)))
+			continue;
+#endif
+		
+		if (who_is_busy_group(lagged_sum, num_busy, max_lagged, max_busy)) {
+			max_lagged = lagged_sum;
+			max_busy = num_busy;
+			busiest = child;
+		}
+	} while (child = child->next, child != sdv->child);
+
+	if (!busiest)
+		return NULL;
+	
+	if (env->idle != CPU_NOT_IDLE)
+		return busiest;
+	
+	if (who_is_busy_group(this_lagged, this_busy, max_lagged, max_busy))
+		return NULL;
+
+	return busiest;
+}
+
+static struct rq *find_most_lagged_rq(struct lb_env *env, 
+					struct sd_vruntime *sdv) 
+{
+	int cpu;
+	s64 this_lagged;
+	s64 lagged, max_lagged;
+	struct rq *rq, *lagged_rq = NULL;
+
+	if (env->idle == CPU_NOT_IDLE) {
+		this_lagged = rq_lagged(env->dst_rq, env->target);
+#if CONFIG_GVTS_TOLERANCE_PERCENT > 0
+		this_lagged += env->tolerance * (1 << (SCHED_LOAD_SHIFT + CONFIG_GVTS_LAGGED_WEIGHT_ADDED_BITS));
+#endif
+	} else {
+		/* for idle or newly idle cases, rq_lagged() = 0.
+		 * But, to pull any tasks, it is required that rq_lagged() = LLONG_MIN */
+		this_lagged = LLONG_MIN;
+	}
+	max_lagged = this_lagged;
+
+	for_each_cpu_and(cpu, sd_vruntime_span(sdv), env->cpus) {
+		gvts_stat_inc(env->sd, lagged_count[env->idle]);
+		rq = cpu_rq(cpu);
+		if (rq->nr_running < 2) {
+			gvts_stat_inc(env->sd, lagged_little_tasks[env->idle]);
+			continue;
+		}
+
+		if (rq->cfs.h_nr_running == 0) {
+			gvts_stat_inc(env->sd, lagged_no_cfs_tasks[env->idle]);
+			continue;
+		}
+	
+		lagged = rq_lagged(rq, env->target);
+		if (lagged <= this_lagged) {
+			/* for stats... this is not necessary.
+			 * Note that the initial value of max_lagged = this_lagged */
+			gvts_stat_inc(env->sd, lagged_pass_soon[env->idle]);
+			continue;
+		}
+
+		if (lagged <= max_lagged) {
+			gvts_stat_inc(env->sd, lagged_not_min[env->idle]);
+			continue;
+		}
+
+		gvts_stat_inc(env->sd, lagged_found[env->idle]);
+		lagged_rq = rq;
+		max_lagged = lagged;
+	}
+
+	return lagged_rq;
+}
+
+/*
+ * can_migrate_lagged_task - may task p from runqueue rq be migrated to this_cpu?
+ * Aggressive migration - do not consider data locality.
+ * TODO: aggressive migration ==> preference based migration.
+ */
+static
+int can_migrate_lagged_task(struct task_struct *p, struct lb_env *env)
+{
+	lockdep_assert_held(&env->src_rq->lock);
+
+	/*
+	 * We do not migrate tasks that are:
+	 * 1) throttled_lb_pair, or
+	 * 2) cannot be migrated to this CPU due to cpus_allowed, or
+	 * 3) running (obviously), or
+	 * 4) are cache-hot on their current CPU.
+	 */
+	if (throttled_lb_pair(task_group(p), env->src_cpu, env->dst_cpu))
+		return 0;
+
+	if (!cpumask_test_cpu(env->dst_cpu, tsk_cpus_allowed(p))) {
+		int cpu;
+
+		schedstat_inc(p, se.statistics.nr_failed_migrations_affine);
+
+		env->flags |= LBF_SOME_PINNED;
+
+		/*
+		 * Remember if this task can be migrated to any other cpu in
+		 * our sched_group. We may want to revisit it if we couldn't
+		 * meet load balance goals by pulling other tasks on src_cpu.
+		 *
+		 * Also avoid computing new_dst_cpu if we have already computed
+		 * one in current iteration.
+		 */
+		if (!env->dst_grpmask || (env->flags & LBF_DST_PINNED))
+			return 0;
+
+		/* Prevent to re-select dst_cpu via env's cpus */
+		for_each_cpu_and(cpu, env->dst_grpmask, env->cpus) {
+			if (cpumask_test_cpu(cpu, tsk_cpus_allowed(p))) {
+				env->flags |= LBF_DST_PINNED;
+				env->new_dst_cpu = cpu;
+				break;
+			}
+		}
+
+		return 0;
+	}
+
+	/* Record that we found at least one task that could run on dst_cpu */
+	env->flags &= ~LBF_ALL_PINNED;
+
+	if (task_running(env->src_rq, p)) {
+		schedstat_inc(p, se.statistics.nr_failed_migrations_running);
+		return 0;
+	}
+
+	return 1;
+}
+
+static struct task_struct *detach_one_lagged_task(struct lb_env *env)
+{
+	struct task_struct *p, *n, *min_p = NULL;
+	u64 min_vruntime = 0;
+	int consider = 0;
+
+	lockdep_assert_held(&env->src_rq->lock);
+
+	list_for_each_entry_safe(p, n, &env->src_rq->cfs_tasks, se.group_node) {
+		if (!can_migrate_lagged_task(p, env))
+			continue;
+
+		if (!vruntime_passed(p->se.vruntime, env->target)) {
+			detach_task(p, env);
+			gvts_stat_inc(env->sd, atb_pushed_under);
+			return p;
+		} else if (min_p == NULL || vruntime_passed(min_vruntime, p->se.vruntime)) {
+			min_p = p;
+			min_vruntime = p->se.vruntime;
+		}
+		
+		consider++;
+		if (consider > sysctl_sched_nr_migrate)
+			break;
+	}
+
+	if (min_p) {
+		detach_task(min_p, env);
+		gvts_stat_inc(env->sd, atb_pushed);
+	} else {
+		gvts_stat_inc(env->sd, atb_failed);
+	}
+	return min_p;
+}
+
+static int detach_lagged_tasks(struct lb_env *env)
+{
+	struct list_head *tasks = &env->src_rq->cfs_tasks;
+	struct task_struct *p;
+	struct task_struct *over_p = NULL, *not_lagged_p = NULL;
+	int detached = 0;
+	u64 target;
+	s64 dst_lagged, src_lagged;
+	s64 lagged_diff;
+	s64 lagged, over_lagged = LLONG_MAX, not_lagged = LLONG_MIN;
+
+	lockdep_assert_held(&env->src_rq->lock);
+
+	gvts_stat_inc(env->sd, detach_count[env->idle]);
+
+	if (env->idle == CPU_NOT_IDLE) {
+		target = env->target + env->interval;
+		dst_lagged = rq_lagged(env->dst_rq, target);
+		src_lagged = rq_lagged(env->src_rq, target);
+		lagged_diff = (src_lagged - dst_lagged) / 2;
+	} else{ /* idle or newly idle */
+		target = env->target;
+		src_lagged = rq_lagged(env->src_rq, target);
+		lagged_diff = src_lagged / 2;
+	}
+
+	/* source is faster than destination */
+	if (unlikely(lagged_diff <= 0)) {
+		gvts_stat_inc(env->sd, detach_neg_diff[env->idle]);
+		return 0;
+	}
+
+	/* rare cases */
+	/* while (unlikely(dst_lagged < 0 || src_lagged < 0)) {
+		target += env->interval;	
+		dst_lagged = rq_lagged(env->dst_rq, target);
+		src_lagged = rq_lagged(env->src_rq, target);
+		lagged_diff = (src_lagged - dst_lagged) / 2;
+	} */
+
+	while (!list_empty(tasks)) {
+		/* TODO: we do not consider ASYM_PACKING */
+
+		if (env->src_rq->nr_running <= 1) {
+			gvts_stat_inc(env->sd, detach_loop_stop[env->idle]);
+			break;
+		}
+
+		p = list_first_entry(tasks, struct task_struct, se.group_node);
+
+		env->loop++;
+		if (env->loop > env->loop_max) {
+			gvts_stat_inc(env->sd, detach_loop_stop[env->idle]);
+			break;
+		}
+
+		if (env->loop > env->loop_break) {
+			env->loop_break += sched_nr_migrate_break;
+			env->flags |= LBF_NEED_BREAK;
+			gvts_stat_inc(env->sd, detach_loop_stop[env->idle]);
+			break;
+		}
+
+		
+		gvts_stat_inc(env->sd, detach_task_count[env->idle]);
+		if (!can_migrate_lagged_task(p, env)) {
+			gvts_stat_inc(env->sd, detach_task_cannot[env->idle]);
+			goto next;
+		}
+
+		lagged = task_lagged(&p->se, target);
+
+		if (lagged <= 0) {
+			if (lagged > not_lagged) {
+				not_lagged_p = p;
+				not_lagged = lagged;
+			}
+			gvts_stat_inc(env->sd, detach_task_not_lag[env->idle]);
+			goto next;
+		}
+
+		if ((lagged / 2) > lagged_diff) {
+			if (lagged < over_lagged) {
+				over_p = p;
+				over_lagged = lagged;
+			}
+			gvts_stat_inc(env->sd, detach_task_too_lag[env->idle]);
+			goto next;
+		}
+		
+		gvts_stat_inc(env->sd, detach_task_detach[env->idle]);
+
+		detach_task(p, env);
+		list_add(&p->se.group_node, &env->tasks);
+
+		detached++;
+		/* note that lagged > 0 */
+		lagged_diff -= lagged;
+
+#ifdef CONFIG_PREEMPT
+		/*
+		 * NEWIDLE balancing is a source of latency, so preemptible
+		 * kernels will stop after the first task is detached to minimize
+		 * the critical section.
+		 */
+		if (env->idle == CPU_NEWLY_IDLE)
+			break;
+#endif
+
+		if (lagged_diff <= 0) {
+			gvts_stat_inc(env->sd, detach_complete[env->idle]);
+			break;
+		}
+
+		continue;
+next:
+		list_move_tail(&p->se.group_node, tasks);
+	}
+
+	if (detached == 0 && over_p) {
+		detach_task(over_p, env);
+		list_add(&over_p->se.group_node, &env->tasks);
+		detached++;
+		gvts_stat_inc(env->sd, detach_task_too_detach[env->idle]);
+	}
+
+	/* for idle cases,
+	   pulling a not lagged task is a good option if there is no other options. */
+	//if (detached == 0 && not_lagged_p && env->idle != CPU_NOT_IDLE) {
+	if (detached == 0 && not_lagged_p) {
+		detach_task(not_lagged_p, env);
+		list_add(&not_lagged_p->se.group_node, &env->tasks);
+		detached++;
+		gvts_stat_inc(env->sd, detach_task_not_detach[env->idle]);
+	}
+
+	gvts_stat_add(env->sd, tb_gained[env->idle], detached);
+
+	return detached;
+}
+
+static int find_dst_cpu(int __sd_level, int src_cpu) {
+	struct sched_domain *sd;
+	int sd_level = -(__sd_level + 1);
+	int cpu, dst_cpu = -1, dst_idle_cpu = -1;
+	unsigned int min_exit_latency = UINT_MAX;
+	u64 latest_idle_timestamp = 0;
+	s64 lagged, min_lagged = LLONG_MAX;
+	u64 target;
+
+	for_each_domain(src_cpu, sd) {
+		if (sd->level == sd_level)
+			break;
+	}
+
+	BUG_ON(!sd);
+
+	/* similar to find_fastest_cpu() */
+	target = atomic64_read(&sd->vruntime->target);
+
+	for_each_cpu(cpu, to_cpumask(sd->span)) {
+		if (cpu == src_cpu) /* prevent to select src_cpu */
+			continue;
+
+		if (idle_cpu(cpu)) {
+			struct rq *rq = cpu_rq(cpu);
+			struct cpuidle_state *idle = idle_get_state(rq);
+
+
+			if (dst_idle_cpu < 0) { /* first */
+				if (idle)
+					min_exit_latency = idle->exit_latency;
+				latest_idle_timestamp = rq->idle_stamp;
+				dst_idle_cpu = cpu;
+			} else if (idle && idle->exit_latency < min_exit_latency) {
+				min_exit_latency = idle->exit_latency;
+				latest_idle_timestamp = rq->idle_stamp;
+				dst_idle_cpu = cpu;
+			} else if ((!idle || idle->exit_latency == min_exit_latency) &&
+						rq->idle_stamp > latest_idle_timestamp) {
+				latest_idle_timestamp = rq->idle_stamp;
+				dst_idle_cpu = cpu;
+			}
+		} else if (dst_idle_cpu == -1) {
+			lagged = cpu_lagged(cpu, target);
+			if (lagged < min_lagged) {
+				min_lagged = lagged;
+				dst_cpu = cpu;
+			}
+
+		}
+	}
+
+	if (unlikely(dst_idle_cpu < 0 && dst_cpu < 0)) { /* error */
+		printk(KERN_ERR "[%s] ERROR cannot find dst_cpu: src: %d sd_level: %d dst_cpu: %d dst_idle_cpu: %d\n", 
+							__func__, src_cpu, -(__sd_level + 1), dst_cpu, dst_idle_cpu);
+		return -1;
+	}
+
+	return dst_idle_cpu >= 0 ? dst_idle_cpu : dst_cpu;
+}
+
+/*
+ * active_target_vruntime_balance_cpu_stop is run by cpu stopper. It pushes
+ * running tasks off the busiest CPU onto idle CPUs. It requires at
+ * least 1 task to be running on each physical CPU where possible, and
+ * avoids physical / logical imbalances.
+ */
+static int active_target_vruntime_balance_cpu_stop(void *data)
+{
+	struct rq *src_rq = data;
+	int src_cpu = cpu_of(src_rq);
+	int dst_cpu = src_rq->push_cpu;
+	struct rq *dst_rq;
+	struct sched_domain *sd;
+	struct task_struct *p = NULL;
+
+	if (dst_cpu >= 0)
+		dst_rq = cpu_rq(dst_cpu);
+	else { /* source activated balancing */
+		dst_cpu = find_dst_cpu(dst_cpu, src_cpu);
+		if (unlikely(dst_cpu < 0))
+			return 0;
+		dst_rq = cpu_rq(dst_cpu);
+	}
+	
+	raw_spin_lock_irq(&src_rq->lock);
+
+	/* make sure the requested cpu hasn't gone down in the meantime */
+	if (unlikely(src_cpu != smp_processor_id() ||
+		     !src_rq->active_balance))
+		goto out_unlock;
+		
+	/* Is there any task to move? */
+	if (src_rq->nr_running <= 1)
+		goto out_unlock;
+
+	/*
+	 * This condition is "impossible", if it occurs
+	 * we need to fix it. Originally reported by
+	 * Bjorn Helgaas on a 128-cpu setup.
+	 */
+	BUG_ON(src_rq == dst_rq);
+
+	/* Search for an sd spanning us and the target CPU. */
+	rcu_read_lock();
+	for_each_domain(dst_cpu, sd) {
+		if (sd->vruntime &&
+			cpumask_test_cpu(src_cpu, sched_domain_span(sd)))
+				break;
+	}
+
+	if (likely(sd)) {
+		struct lb_env env = {
+			.sd		= sd,
+			.dst_cpu	= dst_cpu,
+			.dst_rq		= dst_rq,
+			.src_cpu	= src_cpu,
+			.src_rq		= src_rq,
+			.target     = atomic64_read(&sd->vruntime->target),
+			.interval   = sd->vruntime->interval,
+			.idle		= CPU_IDLE,
+		};
+
+		gvts_stat_inc(sd, atb_count);
+
+		p = detach_one_lagged_task(&env);
+		if (p)
+			gvts_stat_inc(sd, tb_gained[CPU_IDLE]);
+	}
+	rcu_read_unlock();
+
+out_unlock:
+	src_rq->active_balance = 0;
+	raw_spin_unlock(&src_rq->lock);
+
+	if (p)
+		attach_one_task(dst_rq, p);
+
+	local_irq_enable();
+
+	return 0;
+}
+
+int cpu_stop_thread_on_cpu(unsigned int cpu);
+
+static int __target_vruntime_balance(int this_cpu, struct rq *this_rq, 
+					struct sched_domain *sd, enum cpu_idle_type idle,
+					u64 target, u64 interval, u64 tolerance) 
+{
+	int pulled_tasks = 0, cur_pulled_tasks;
+	int need_active_balance = 0, do_active_balance = 0;
+	struct sd_vruntime *child;
+	
+	struct rq *lagged_rq;
+	unsigned long flags;
+	struct cpumask *cpus = this_cpu_cpumask_var_ptr(load_balance_mask);
+	
+	struct lb_env env = {
+		.sd		= sd,
+		.dst_cpu	= this_cpu,
+		.dst_rq		= this_rq,
+		//.dst_grpmask    = sched_group_cpus(sd->groups),
+		.idle		= idle,
+		.loop		= 0,
+		.loop_break	= sched_nr_migrate_break,
+		.cpus		= cpus,
+		.tasks		= LIST_HEAD_INIT(env.tasks),
+		.target 	= target,
+		.interval   = interval,
+		.tolerance  = idle == CPU_NOT_IDLE ? tolerance : 0,
+	};
+
+#if CONFIG_GVTS_TOLERANCE_PERCENT > 0
+	/* if idle != CPU_NOT_IDLE, ignore the tolerance */
+	/* if (idle == CPU_NOT_IDLE)
+		env.target -= tolerance; */
+#endif
+//printk(KERN_ERR "[%s](%d) 0\n", __func__, this_cpu);
+	
+	cpumask_and(cpus, cpu_active_mask, sched_domain_span(sd));
+	
+	/* since local group balancing was considered at lower level domain,
+	   ignore the local group CPUs */
+	if (sd->vruntime->child == NULL)
+		cpumask_clear_cpu(this_cpu, cpus);
+	else {
+		struct sched_domain *sd_child = sd->child;
+		while (sd_child && sd_child->vruntime == NULL)
+			sd_child = sd_child->child;
+		cpumask_andnot(cpus, cpus, sd_vruntime_span(sd_child->vruntime));
+	}
+
+	gvts_stat_inc(sd, tb_count[idle]);
+
+redo:
+
+	child = find_most_lagged_child(&env);
+	if (child == NULL) {
+		gvts_stat_inc(sd, tb_nolaggedgroup[idle]);
+		goto out_balanced;
+	}
+
+	lagged_rq = find_most_lagged_rq(&env, child);
+	if (lagged_rq == NULL) {
+		gvts_stat_inc(sd, tb_nolaggedcpu[idle]);
+		goto out_balanced;
+	}
+
+	env.src_cpu = lagged_rq->cpu;
+	env.src_rq = lagged_rq;
+
+	pulled_tasks = 0;
+	if (env.src_rq->nr_running > 1) {
+		/* attempt to move lagged tasks. */
+		env.flags |= LBF_ALL_PINNED;
+		env.loop_max = min(sysctl_sched_nr_migrate, env.src_rq->nr_running);
+
+		raw_spin_lock_irqsave(&env.src_rq->lock, flags);
+
+		/* cur_pulled_tasks - # tasks moved in current iteration
+		 * pulled_tasks     - # tasks moved across iterations
+		 */
+		cur_pulled_tasks = detach_lagged_tasks(&env);
+
+		raw_spin_unlock(&env.src_rq->lock);
+
+		if (cur_pulled_tasks) {
+			attach_tasks(&env);
+			pulled_tasks += cur_pulled_tasks;
+		}
+
+		local_irq_restore(flags);
+		
+		/* All tasks on this runqueue were pinned by CPU affinity */
+		if (unlikely(env.flags & LBF_ALL_PINNED)) {
+			cpumask_clear_cpu(env.src_cpu, cpus);
+			if (!cpumask_empty(cpus)) {
+				env.loop = 0;
+				env.loop_break = sched_nr_migrate_break;
+				goto redo;
+			}
+			goto out_all_pinned;
+		} else if (pulled_tasks == 0) {
+			/* !(env.flags & LBF_ALL_PINNED) && pulled_tasks == 0
+				=> the only task possible to pull is the running task */
+			gvts_stat_inc(sd, tb_all_pinned_but_running[idle]);
+			need_active_balance = 1;
+		}
+
+	} else {
+		/* env.src_rq->nr_running == 1
+		 * TODO
+		 * 1. For uneven multicores, we may consider its characteristics.
+		 * 2. Even for SMP, we may consider the migration if
+		 *     1) the task in lagged_rq have running_time / runnable_time < 1.0,
+		 *        since lagged_rq actually have 2+ tasks, but others are blocked for a while.
+		 *     2) this_rq is in long idle periods.
+		 *
+		 * if the migration is needed, set @need_active_balance = 1.
+		 */
+		 
+
+		 /* BUT, NOW, WE DO NOTHING. */
+		 /* XXX: if you want to do something more,
+		 		please modify find_most_lagged_rq().
+				It ignores rq with nr_running < 2 */
+	}
+
+	if (need_active_balance) {
+		raw_spin_lock_irqsave(&env.src_rq->lock, flags);
+
+		if (env.src_rq->cfs.h_nr_running == 0) {
+			env.flags |= LBF_ALL_PINNED;
+			goto unlock_one_pinned;
+		}
+
+		if (env.src_rq->curr->sched_class == &fair_sched_class) {
+			if (!cpumask_test_cpu(this_cpu,
+					tsk_cpus_allowed(env.src_rq->curr))) {
+				env.flags |= LBF_ALL_PINNED;
+				goto unlock_one_pinned;
+			} 
+		}
+
+		/*
+		 * ->active_balance synchronizes accesses to
+		 * ->active_balance_work.  Once set, it's cleared
+		 * only after active load balance is finished.
+		 */
+		if (!env.src_rq->active_balance
+			/* if source activated balancing is used,
+			 * there may be contention on stopper[cpu]->thread->on_cpu.
+			 * See kernel/sched/core.c:try_to_wake_up()=>smp_cond_acquire(!p->on_cpu)
+			 * It may cause large amount of loops 
+			 */
+				&& !cpu_stop_thread_on_cpu(env.src_cpu)) {
+			env.src_rq->active_balance = 1;
+			env.src_rq->push_cpu = this_cpu;
+			do_active_balance = 1;
+		}
+unlock_one_pinned:
+		raw_spin_unlock_irqrestore(&env.src_rq->lock, flags);
+
+		if (do_active_balance) {
+			stop_one_cpu_nowait(cpu_of(env.src_rq),
+				active_target_vruntime_balance_cpu_stop, env.src_rq,
+				&env.src_rq->active_balance_work);
+		}
+		
+	}
+
+out_balanced:
+out_all_pinned:
+	return pulled_tasks;
+}
+
+static int _target_vruntime_balance(struct rq *this_rq, enum cpu_idle_type idle_init) {
+	int pulled_tasks = 0;
+	int this_cpu = this_rq->cpu;
+	enum cpu_idle_type idle = idle_init;
+	struct cfs_rq *cfs_rq = &this_rq->cfs;
+	struct sched_domain *sd;
+	struct sd_vruntime *sd_vruntime;
+	u64 target, interval, tolerance;
+	u64 old_target;
+	u64 my_target;
+	u64 min_vruntime;
+	
+	min_vruntime = real_min_vruntime(cfs_rq);
+	my_target = cfs_rq->target_vruntime; /* next level-0 target (updated at target_vruntime_balance() */
+	interval = cfs_rq->target_interval;
+
+	while (unlikely(vruntime_passed(min_vruntime, my_target + interval))) {
+		my_target += interval;
+	}
+	
+	update_blocked_averages(this_cpu); // We do not care the load now...
+	
+	rcu_read_lock();
+	for_each_domain(this_cpu, sd) {
+		if (!sd->vruntime)
+			continue;
+
+		sd_vruntime = sd->vruntime;
+		target = atomic64_read(&sd_vruntime->target);
+		interval = sd_vruntime->interval;
+		tolerance = sd_vruntime->tolerance;
+
+		gvts_stat_inc(sd, tvb_count[idle_init]);
+
+		if (vruntime_passed(target, min_vruntime) && idle == CPU_NOT_IDLE) {
+			gvts_stat_inc(sd, tvb_not_reach[idle_init]);
+			/* we do not reach the target yet. See you later. */
+			break;
+		}
+
+		/* newly idle cases are the source of latency.
+		 * if this is a newly idle case and there is any pulled tasks,
+		 * do not pull tasks further and just check the higher level domains. */
+		if (pulled_tasks == 0 || idle_init != CPU_NEWLY_IDLE) {
+#ifdef CONFIG_GVTS_STATS
+			int temp;
+			temp = __target_vruntime_balance(this_cpu, this_rq, sd, idle,
+												target, interval, tolerance);
+			gvts_stat_inc(sd, tvb_pull_count[idle_init]);
+			if (temp > 0)
+				gvts_stat_add(sd, tvb_pull_gained[idle_init], temp);
+			else
+				gvts_stat_inc(sd, tvb_pull_no_gain[idle_init]);
+#else /* !CONFIG_GVTS_STATS */
+			pulled_tasks += __target_vruntime_balance(this_cpu, this_rq, sd, idle,
+														target, interval, tolerance);
+#endif /* !CONFIG_GVTS_STATS */
+		}
+
+		if (pulled_tasks > 0) {
+			/* Now, we do not use LBF_DST_PINNED logic. *
+			 * Refer to rebalance_domains()             */
+			idle = idle_cpu(this_cpu) ? idle_init : CPU_NOT_IDLE;
+			min_vruntime = real_min_vruntime(cfs_rq);
+		} else if (idle != CPU_NOT_IDLE) {
+			/* cpu is idle, but nothing to pull... */
+			/* even if min_vruntime > target, do not update the target.
+			   The actual value of min_vruntime = 0. */
+			gvts_stat_inc(sd, tvb_idle_continue[idle_init]);
+			continue;
+		}
+
+		target = atomic64_read(&sd_vruntime->target); /* refresh the target */
+		   
+		if (vruntime_passed(target, min_vruntime)) {
+			if (idle != CPU_NOT_IDLE)
+				update_min_target(sd_vruntime, target, 0);
+
+			if (pulled_tasks > 0) {
+				gvts_stat_inc(sd, tvb_stay[idle_init]);
+				break; /* stay in this round */
+			} else { /* pulled_tasks == 0 */
+				/* We are the lagged or idle cpu, but no jobs to pull.
+				 * Thus, we do not need to update the target of domain at this level.
+				 * Let's go to the higher level.
+				 */
+				gvts_stat_inc(sd, tvb_not_update[idle_init]);
+				continue;
+			}
+		}
+
+		/* Every core in this domain is ok. Go to the next round.
+		 * (even if cpu is idle, we have min_vruntime > my_target.
+		 * We should go to the next round.)
+		 */
+again:
+		old_target = target;
+		while (my_target >= target)
+			target += interval;
+		/* Between sd_vruntime->target and sd_vruntime->updated_by, racing is allowed */
+		target = atomic64_cmpxchg(&sd_vruntime->target, old_target, target);
+		if (target == old_target) {
+			atomic_set(&sd_vruntime->updated_by, this_cpu);
+			gvts_stat_inc(sd, tvb_update_target[idle_init]);
+		} else {
+			gvts_stat_inc(sd, target_update_racing);
+			if (my_target >= target)
+				goto again;
+		}
+		update_min_target(sd_vruntime, atomic64_read(&sd_vruntime->target), 1);
+	}
+
+	rcu_read_unlock();
+
+#ifdef CONFIG_NO_HZ_COMMON
+	/* to prevent repetitive balancing in a tick */
+	this_rq->next_balance = jiffies + 1;
+#endif
+
+	return pulled_tasks;
+}
+
+/* for GVTS_STATS, source activated balancing and detecting infeasible weight tasks */
+static u64 check_target_diff(struct rq *rq, struct sched_domain **large_diff_sd) {
+	int cpu = cpu_of(rq);
+	struct sched_domain *sd;
+	struct sd_vruntime *sd_vruntime;
+	u64 my_target = rq->cfs.target_vruntime;
+	u64 target, interval; 
+	u64 diff, max_diff = 0;
+
+	rcu_read_lock();
+	for_each_domain(cpu, sd) {
+		sd_vruntime = sd->vruntime;
+		if (!sd_vruntime)
+			continue;
+		target = atomic64_read(&sd_vruntime->target);
+		interval = sd_vruntime->interval;
+
+		if (target > my_target) {
+			diff = (target - my_target) / interval;
+			if (diff > CONFIG_GVTS_TARGET_DIFF_THRESHOLD) {
+				*large_diff_sd = sd;
+				if (diff > max_diff)
+					max_diff = diff;
+			}
+		}
+#ifdef CONFIG_GVTS_STATS
+		else
+			diff = 0;
+		if (diff >= NUM_MAX_TARGET_DIFF)
+			diff = NUM_MAX_TARGET_DIFF - 1;
+		gvts_stat_inc(sd, target_diff[diff]);
+#endif /* CONFIG_GVTS_STATS */
+	}
+	rcu_read_unlock();
+
+	return max_diff;
+}
+
+void check_infeasible_weight(struct rq *this_rq, u64 max_diff, struct sched_domain *sd) {
+	struct sd_vruntime *sdv;
+	struct rq *rq;
+	int cpu;
+	int infeasible_weight;
+
+	if (max_diff < CONFIG_GVTS_TARGET_DIFF_INFEASIBLE_WEIGHT) { /* target diff < GVTS_TARGET_DIFF_INFEASIBLE_WEIGHT */
+		if (this_rq->infeasible_weight)
+			this_rq->infeasible_weight = 0;
+		return;
+	}
+
+#if CONFIG_GVTS_TARGET_DIFF_INFEASIBLE_WEIGHT < CONFIG_GVTS_TARGET_DIFF_THRESHOLD
+	if (unlikely(!sd))
+		return;
+#endif
+
+	if (this_rq->cfs.h_nr_running > 1)
+		return;
+
+	if (this_rq->infeasible_weight)
+		return;
+
+	sdv = sd->vruntime;
+	cpu = atomic_read(&sdv->updated_by);
+	if (cpu >= 0) {
+		rq = cpu_rq(cpu);
+		if (rq->cfs.lagged_weight <= this_rq->cfs.lagged_weight) {
+			/* we cannot catch up the target */
+			goto detect_infeasible_weight;
+		}
+	}
+
+	infeasible_weight = 0;
+	for_each_cpu(cpu, to_cpumask(sdv->span)) {
+		if (idle_cpu(cpu))
+			continue;
+
+		rq = cpu_rq(cpu);
+
+		if (rq->infeasible_weight)
+			continue;
+
+		if (rq->cfs.lagged_weight > this_rq->cfs.lagged_weight) {
+			infeasible_weight = 0;
+			break;
+		}
+
+		/* Now, this_rq can have infeasible weight 
+			unless there is a CPU with rq->cfs.lagged_weight > this_rq->cfs.lagged_weight*/
+		infeasible_weight = 1; 
+	}
+
+	if (infeasible_weight == 0)
+		return;
+
+detect_infeasible_weight:
+	this_rq->infeasible_weight = 1;
+	delete_min_target_rq(&this_rq->cfs);
+}
+
+static int target_vruntime_balance(struct rq *this_rq, enum cpu_idle_type idle)
+{
+	int pulled_tasks = 0;
+	struct sched_domain *large_diff_sd = NULL;
+	u64 max_diff;
+	int do_active_balance = 0;
+	struct cfs_rq *cfs_rq = &this_rq->cfs;
+	u64 target;
+	u64 min_vruntime = real_min_vruntime(cfs_rq);
+
+	if (unlikely(!this_rq->sd_vruntime))
+		/* XXX: during initialization....how to prevent this? 
+				What is the proper value for initial target_vruntime? */
+		return 0;
+
+	gvts_stat_inc(this_rq, tvb_count[idle]);
+
+	max_diff = check_target_diff(this_rq, &large_diff_sd);
+	check_infeasible_weight(this_rq, max_diff, large_diff_sd);
+	
+	if (large_diff_sd && this_rq->nr_running > 1) {
+		gvts_stat_inc(this_rq, satb_cond);
+		/* if cpu_stopper->thread->on_cpu == 1, 
+		 * cpu_stopper may be the previous task,
+		 * then kernel/sched/core.c:try_to_wake_up()=>smp_cond_acquire(!p->on_cpu) causes infinite loop. */
+		if (!this_rq->active_balance && !cpu_stop_thread_on_cpu(cpu_of(this_rq))) {
+			this_rq->active_balance = 2;
+			this_rq->push_cpu = -large_diff_sd->level - 1;
+			do_active_balance = 1;
+			gvts_stat_inc(this_rq, satb_try);
+			goto skip_fast_check;
+		}
+	} 
+
+	if (idle == CPU_NOT_IDLE) {
+		/* Fast level-0 checking before release the lock. */
+		target = atomic64_read(&this_rq->sd_vruntime->target);
+		if (vruntime_passed(target, min_vruntime)) {
+			target = cfs_rq->target_vruntime;
+			while (vruntime_passed(min_vruntime, target))
+				target += cfs_rq->target_interval;
+			
+			/* we are not the fastest one. Just update the target. */
+			update_target_vruntime_cache(cfs_rq, target, 1);
+			gvts_stat_inc(this_rq, tvb_fast_path[idle]);
+			return 0;
+		}
+	}
+
+skip_fast_check:
+	/*
+	 * We must set idle_stamp _before_ calling idle_balance(), such that we
+	 * measure the duration of idle_balance() as idle time.
+	 */
+	if (idle == CPU_NEWLY_IDLE)
+		this_rq->idle_stamp = rq_clock(this_rq);
+
+	raw_spin_unlock(&this_rq->lock);
+
+	if (do_active_balance) {
+		stop_one_cpu_nowait(cpu_of(this_rq),
+			active_target_vruntime_balance_cpu_stop, this_rq,
+			&this_rq->active_balance_work);
+	} else /* call _target_vruntime_balance */
+		pulled_tasks = _target_vruntime_balance(this_rq, idle);
+			
+	raw_spin_lock(&this_rq->lock);
+	
+	/* for load aware GVTS, target vruntime cache is tightly related to cfs_rq->lagged.
+	 * Thus, we need to synchronize the values,
+	 * and we update it under rq->lock. 
+	 */
+	target = cfs_rq->target_vruntime;
+	min_vruntime = real_min_vruntime(cfs_rq);
+	while (vruntime_passed(min_vruntime, target))
+		target += cfs_rq->target_interval;
+	if (cfs_rq->target_vruntime < target)
+		update_target_vruntime_cache(cfs_rq, target, 1);
+	
+	/*
+	 * While browsing the domains, we released the rq lock, a task could
+	 * have been enqueued in the meantime. Since we're not going idle,
+	 * pretend we pulled a task.
+	 */
+	if (this_rq->cfs.h_nr_running && !pulled_tasks)
+		pulled_tasks = 1;
+
+	/* Is there a task of a high priority class? */
+	if (this_rq->nr_running != this_rq->cfs.h_nr_running)
+		pulled_tasks = -1;
+
+	if (idle == CPU_NEWLY_IDLE && pulled_tasks)
+		this_rq->idle_stamp = 0;
+
+	return pulled_tasks;
+}
+#endif /* CONFIG_GVTS */
 
 /*
  * run_rebalance_domains is triggered when needed from the scheduler tick.
@@ -10800,7 +12222,11 @@ static __latent_entropy void run_rebalance_domains(struct softirq_action *h)
 
 	/* normal load balance */
 	update_blocked_averages(this_rq->cpu);
+#ifdef CONFIG_GVTS
+	_target_vruntime_balance(this_rq, idle);
+#else /* !CONFIG_GVTS */
 	rebalance_domains(this_rq, idle);
+#endif /* !CONFIG_GVTS */
 }
 
 /*
@@ -10812,8 +12238,19 @@ void trigger_load_balance(struct rq *rq)
 	if (unlikely(on_null_domain(rq)))
 		return;
 
+#ifdef CONFIG_GVTS
+	/* call the target_vruntime_balance() for each tick. */
+#ifdef CONFIG_NO_HZ_COMMON
+	if (rq->idle_balance && time_after_eq(jiffies, rq->next_balance))
+		raise_softirq(SCHED_SOFTIRQ);
+#else
+	if (rq->idle_balance)
+		raise_softirq(SCHED_SOFTIRQ);
+#endif
+#else /* !CONFIG_GVTS */
 	if (time_after_eq(jiffies, rq->next_balance))
 		raise_softirq(SCHED_SOFTIRQ);
+#endif /* !CONFIG_GVTS */
 
 	nohz_balancer_kick(rq);
 }
@@ -10853,11 +12290,29 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 		entity_tick(cfs_rq, se, queued);
 	}
 
+#ifdef CONFIG_GVTS
+	if (update_eff_load(&curr->se, se))
+		/* if eff_load is updated, update the lagged. */
+		update_lagged(&curr->se, &rq->cfs);
+#endif
+
 	if (static_branch_unlikely(&sched_numa_balancing))
 		task_tick_numa(rq, curr);
 
 	update_misfit_status(curr, rq);
 	update_overutilized_status(task_rq(curr));
+
+#ifdef CONFIG_GVTS
+	/* current task reach at the target. 
+	 * when rq->cfs.nr_running > 1 => schedule one of other tasks that do not reach the target. 
+	 *	                              If all tasks reach the target, call target_vruntime_balance().
+	 * when rq->cfs.nr_running == 1 => call target_vruntime_balance() */
+	if (unlikely(vruntime_passed(curr->se.vruntime, rq->cfs.target_vruntime))) {
+		resched_curr(rq);
+		clear_buddies(task_cfs_rq(curr), &curr->se);
+		return;
+	}
+#endif /* CONFIG_GVTS */
 }
 
 /*
@@ -10882,6 +12337,9 @@ static void task_fork_fair(struct task_struct *p)
 		se->vruntime = curr->vruntime;
 	}
 	place_entity(cfs_rq, se, 1);
+#ifdef CONFIG_GVTS
+	account_start_debit(cfs_rq, se);
+#endif
 
 	if (sysctl_sched_child_runs_first && curr && entity_before(curr, se)) {
 		/*
@@ -10891,8 +12349,9 @@ static void task_fork_fair(struct task_struct *p)
 		swap(curr->vruntime, se->vruntime);
 		resched_curr(rq);
 	}
-
+#ifndef CONFIG_GVTS	/* for GVTS, do not normalize vruntime based on min_vruntime */
 	se->vruntime -= cfs_rq->min_vruntime;
+#endif /* !CONFIG_GVTS */
 	rq_unlock(rq, &rf);
 }
 
@@ -11006,6 +12465,7 @@ static void detach_task_cfs_rq(struct task_struct *p)
 	struct sched_entity *se = &p->se;
 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
 
+#ifndef CONFIG_GVTS /* for GVTS, do not normalize vruntime while detaching */
 	if (!vruntime_normalized(p)) {
 		/*
 		 * Fix up our vruntime so that the current sleep doesn't
@@ -11014,8 +12474,12 @@ static void detach_task_cfs_rq(struct task_struct *p)
 		place_entity(cfs_rq, se, 0);
 		se->vruntime -= cfs_rq->min_vruntime;
 	}
+#endif /* !CONFIG_GVTS */
 
 	detach_entity_cfs_rq(se);
+#ifdef CONFIG_GVTS
+	update_tg_load_sum(se, cfs_rq->tg, se->load.weight, 0, TG_LOAD_SUM_DETACH);
+#endif
 }
 
 static void attach_task_cfs_rq(struct task_struct *p)
@@ -11024,9 +12488,14 @@ static void attach_task_cfs_rq(struct task_struct *p)
 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
 
 	attach_entity_cfs_rq(se);
+#ifdef CONFIG_GVTS
+	update_tg_load_sum(se, cfs_rq->tg, 0, se->load.weight, TG_LOAD_SUM_ATTACH);
+#endif
 
+#if !defined(CONFIG_GVTS) /* for GVTS, do not normalize vruntime base on min_vruntime */
 	if (!vruntime_normalized(p))
 		se->vruntime += cfs_rq->min_vruntime;
+#endif /* !CONFIG_GVTS */
 }
 
 static void switched_from_fair(struct rq *rq, struct task_struct *p)
@@ -11259,6 +12728,30 @@ void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
 
 static DEFINE_MUTEX(shares_mutex);
 
+#ifdef CONFIG_GVTS
+static void __sched_group_set_shares(struct task_group *tg, unsigned long old, unsigned long new) 
+{
+	unsigned long ret;
+
+	if (!tg->parent)
+		return;
+
+	/* lock the load_sum not to be 0 */
+	ret = atomic_long_add_return(1, &tg->load_sum);
+	if (ret == 1) /* load_sum was zero */
+		__update_tg_load_sum(tg->parent, 0, new);
+	else /*	load_sum was not zero */
+		__update_tg_load_sum(tg->parent, old, new);
+
+	tg->shares = new;
+
+	ret = atomic_long_sub_return(1, &tg->load_sum);
+	if (ret == 0) /* load_sum is now 0 */
+		__update_tg_load_sum(tg->parent, new, 0);
+
+}
+#endif
+
 int sched_group_set_shares(struct task_group *tg, unsigned long shares)
 {
 	int i;
@@ -11275,7 +12768,12 @@ int sched_group_set_shares(struct task_group *tg, unsigned long shares)
 	if (tg->shares == shares)
 		goto done;
 
+#ifdef CONFIG_GVTS
+	/* update load_sum of parent */
+	__sched_group_set_shares(tg, tg->shares, shares);
+#else
 	tg->shares = shares;
+#endif
 	for_each_possible_cpu(i) {
 		struct rq *rq = cpu_rq(i);
 		struct sched_entity *se = tg->se[i];
